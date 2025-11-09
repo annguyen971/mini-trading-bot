@@ -1,13 +1,11 @@
+from datetime import datetime
+from ingestion import process_and_ingest_data
+
 def check_backpressure():
     """
     Placeholder for checking the backpressure flag from the database.
-
-    In a real implementation, this function would connect to the PostgreSQL
-    database, query the 'control_flags' table for the 'SCRAPE_SLOW' flag,
-    and return its boolean value.
     """
     print("Checking for backpressure signal ('SCRAPE_SLOW' flag)... Disabled")
-    # For now, we'll simulate the flag being off.
     return False
 
 def main():
@@ -18,10 +16,31 @@ def main():
 
     if is_slowdown_enabled:
         print("Backpressure enabled: scraper will run at 50% speed.")
-        # Logic to reduce scraping speed would be implemented here.
     else:
         print("Backpressure disabled: scraper will run at full speed.")
-        # Full speed scraping logic.
+
+    # --- Simulate fetching and processing one piece of data ---
+    print("\n--- Simulating a new SA data event ---")
+
+    # This raw data would come from an external source
+    sample_raw_data = {
+        "id": "sa-12345",
+        "source": "example-news.com",
+        "author": "John Doe",
+        "url": "http://example-news.com/article/123",
+        "text": "This is a sample news article about a stock.",
+        "publisher_time": datetime(2025, 11, 9, 15, 30, 0), # Naive datetime
+        "entities": ["STOCK_ABC"]
+    }
+
+    # Call the core ingestion workflow
+    process_and_ingest_data(
+        raw_data=sample_raw_data,
+        source_name="example-news",
+        task_kind="process_sa_data"
+    )
+
+    print("\nScraper worker finished.")
 
 if __name__ == "__main__":
     main()
