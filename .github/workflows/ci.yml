@@ -1,0 +1,43 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Build all Docker services
+        run: docker-compose build
+
+      - name: Lint with Ruff and Black
+        run: |
+          pip install ruff black
+          ruff check .
+          black --check .
+
+      - name: Run tests with pytest
+        run: |
+          cp .env.example .env
+          docker-compose up -d db
+          echo "Waiting for database to be healthy..."
+          timeout 60s bash -c 'until [ "$(docker inspect -f {{.State.Health.Status}} $(docker-compose ps -q db))" = "healthy" ]; do sleep 2; done'
+
+          echo "Running tests..."
+          # Install test dependencies and run tests inside the worker container.
+          # We mount the core_lib directory to ensure the tests are available.
+          docker-compose run --rm \
+            -v $(pwd)/src/core_lib:/app/src/core_lib \
+            worker \
+            sh -c "pip install pytest && pytest /app/src/core_lib/tests"
+
+      - name: Smoke test /readyz endpoint
+        run: |
+          docker-compose up -d api
+          timeout 90s bash -c 'until curl -s http://127.0.0.1:8000/readyz; do sleep 1; done'
