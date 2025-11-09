@@ -1,0 +1,8 @@
+[project]
+name = "api"
+version = "0.1.0"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "core-lib @ file://../core_lib",
+]

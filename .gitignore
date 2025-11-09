@@ -1,0 +1,28 @@
+# Environments
+.env
+.venv
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local files
+.DS_Store
+*.log
+*.log.*
+*.swp
+.idea/
+.vscode/

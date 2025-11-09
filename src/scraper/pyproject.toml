@@ -1,0 +1,8 @@
+[project]
+name = "scraper"
+version = "0.1.0"
+dependencies = [
+    "httpx",
+    "beautifulsoup4",
+    "core-lib @ file://../core_lib",
+]
