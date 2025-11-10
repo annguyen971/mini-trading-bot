@@ -69,9 +69,12 @@ def run_label_batch():
             df["probability"] = label_model.predict_proba(L=L_train).max(axis=1)
 
             # Quality Gate
-            summary = L_train.get_snorkel_summary()
-            if summary['Coverage'] < 0.6 or summary['Abstain'] > 0.4:
-                raise Exception(f"Quality gate failed: Coverage={summary['Coverage']}, Abstain={summary['Abstain']}")
+            from snorkel.labeling.analysis import lf_summary
+            summary = lf_summary(L_train, lfs=lfs)
+            coverage = summary["Coverage"].mean()
+            abstain_rate = 1 - coverage
+            if coverage < 0.6 or abstain_rate > 0.4:
+                raise Exception(f"Quality gate failed: Coverage={coverage}, Abstain Rate={abstain_rate}")
 
             # Calculate entropy
             probs = label_model.predict_proba(L=L_train)
@@ -89,6 +92,32 @@ def run_label_batch():
                             probability = EXCLUDED.probability,
                             entropy = EXCLUDED.entropy;
                     """, (row['symbol'], row['effective_date'], row['state_snorkel'], row['probability'], row['entropy']))
+
+            # Active Learning Logic
+            p90_entropy = df["entropy"].quantile(0.9)
+            grey_area = df[
+                (df["entropy"] >= p90_entropy) |
+                ((df["HunterScore"] >= 80) & (df["FrothScore"] <= 20))
+            ]
+
+            # Stratified Sampling
+            selected_samples = grey_area.groupby(['sector', 'cap_tercile']).head(1)
+
+            # Add Honeypot on Sundays
+            if pd.Timestamp.now().dayofweek == 6:
+                honeypot = df.sample(1)
+                selected_samples = pd.concat([selected_samples, honeypot])
+
+            # Write to al_queue
+            with conn.cursor() as cur:
+                for _, row in selected_samples.iterrows():
+                    year_week = pd.Timestamp(row['effective_date']).strftime('%Y-%U')
+                    dedup_key = f"{row['symbol']}:{row['effective_date']}:{year_week}"
+                    cur.execute("""
+                        INSERT INTO al_queue (symbol, effective_date, reason, dedup_key)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (dedup_key) DO NOTHING;
+                    """, (row['symbol'], row['effective_date'], 'uncertainty', dedup_key))
             conn.commit()
 
         finally:
