@@ -1,15 +1,27 @@
 from fastapi import FastAPI, Response, status
+from core_lib.db import get_db_connection
 
 app = FastAPI()
 
 # --- Placeholder Functions for Readiness Checks ---
 
 def check_db_connection():
-    """Placeholder for checking database connectivity."""
-    # In a real implementation, this would connect to the DB
-    # and run a simple query like 'SELECT 1'.
-    print("Checking DB connection... OK")
-    return True
+    """(AC3) Checks if a connection to the database can be established."""
+    print("Checking DB connection...")
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        print("DB connection... OK")
+        return True
+    except Exception as e:
+        print(f"DB connection... FAILED: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 def check_model_loaded():
     """Placeholder for checking if the model is in the cache."""
@@ -17,11 +29,40 @@ def check_model_loaded():
     print("Checking model cache... OK")
     return True
 
+from datetime import datetime, timedelta, timezone
+
 def check_data_freshness():
-    """Placeholder for checking the freshness of the serving data."""
-    # This would query the serving table for the latest as_of_time.
-    print("Checking data freshness... OK")
-    return True
+    """
+    (AC3) Checks that the most recent data in `raw_bronze` is not older
+    than 26 hours.
+    """
+    print("Checking data freshness...")
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT MAX(as_of_time) FROM raw_bronze;")
+            latest_timestamp = cursor.fetchone()[0]
+
+            if not latest_timestamp:
+                print("Data freshness... FAILED: No data in raw_bronze.")
+                return False
+
+            freshness_threshold = datetime.now(timezone.utc) - timedelta(hours=26)
+
+            if latest_timestamp >= freshness_threshold:
+                print(f"Data freshness... OK (Latest data: {latest_timestamp})")
+                return True
+            else:
+                print(f"Data freshness... FAILED (Latest data: {latest_timestamp} is older than 26 hours)")
+                return False
+
+    except Exception as e:
+        print(f"Data freshness... FAILED: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 # --- Endpoints ---
 
