@@ -1,16 +1,37 @@
 import pytest
+import psycopg2
+import os
+import json
+from src.worker.main import main as process_tasks
 
-def test_task_moves_to_dlq_after_retries():
-    """
-    Placeholder for a test that verifies the task_q -> DLQ logic.
+@pytest.fixture(scope="module")
+def db_conn():
+    conn = psycopg2.connect(os.getenv("PG_TEST_DSN"))
+    yield conn
+    conn.close()
 
-    This test will ensure that a task that fails repeatedly is correctly
-    moved to the dead-letter queue (DLQ) after the maximum number of
-    retries has been exceeded.
-    """
-    # Arrange: Create a task in the task_q that is designed to fail
+def test_dlq_mechanism(db_conn):
+    with db_conn.cursor() as cur:
+        # Arrange: Insert a malformed task into task_q
+        cur.execute("DELETE FROM task_q;")
+        cur.execute("DELETE FROM task_q_dlq;")
 
-    # Act: Process the queue multiple times to trigger retries and the DLQ move
+        malformed_payload = json.dumps({"symbol": "INVALID-SYMBOL"})
+        cur.execute("""
+            INSERT INTO task_q (task_type, payload)
+            VALUES (%s, %s) RETURNING id;
+        """, ("ta.bar", malformed_payload))
+        task_id = cur.fetchone()[0]
+        db_conn.commit()
 
-    # Assert: Verify the task is no longer in task_q and is now in task_q_dlq
-    assert True  # Placeholder assertion
+        # Act: Run the worker process
+        process_tasks()
+
+        # Assert: Verify the task is moved to task_q_dlq
+        cur.execute("SELECT * FROM task_q WHERE id = %s;", (task_id,))
+        assert cur.fetchone() is None
+
+        cur.execute("SELECT * FROM task_q_dlq WHERE task_id = %s;", (task_id,))
+        dlq_entry = cur.fetchone()
+        assert dlq_entry is not None
+        assert dlq_entry[2] == 'sanity_fail'
