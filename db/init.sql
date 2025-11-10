@@ -71,6 +71,15 @@ CREATE TABLE IF NOT EXISTS sa_silver (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sa_silver_text_norm_hash ON sa_silver (text_norm_hash);
 
+CREATE TABLE IF NOT EXISTS catalyst_flags (
+  sa_silver_ref_id TEXT REFERENCES sa_silver(url_canonical),
+  flag_name TEXT NOT NULL, -- e.g., 'M&A', 'EARNINGS_SURPRISE'
+  value REAL, -- Optional value, e.g., surprise percentage
+  as_of_time TIMESTAMPTZ NOT NULL,
+  validated_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (sa_silver_ref_id, flag_name)
+);
+
 
 CREATE TABLE IF NOT EXISTS features_gold (
   symbol TEXT NOT NULL,

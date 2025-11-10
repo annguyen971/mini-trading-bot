@@ -1,0 +1,2 @@
+# (Story 2.1/AC1) Run the NLP Cascade batch job at 01:00 UTC every day.
+0 1 * * * docker compose exec worker python -m worker.tasks_nlp

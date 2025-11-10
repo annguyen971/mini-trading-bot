@@ -5,5 +5,7 @@ dependencies = [
     "polars",
     "transformers",
     "snorkel",
+    "scikit-learn",
+    "onnxruntime",
     "core-lib @ file://../core_lib",
 ]
