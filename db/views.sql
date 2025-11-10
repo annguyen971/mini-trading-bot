@@ -4,7 +4,7 @@ CREATE OR REPLACE VIEW v_features_asof AS
 WITH sa_agg AS (
     SELECT
         s.symbols[1] AS symbol,
-        date_trunc('day', s.publisher_time_utc) AS trade_date,
+        date_trunc('day', s.publisher_time) AS trade_date,
         -- Aggregate sentiment/hype scores for each symbol per day.
         -- Using placeholders for now as the exact logic is not specified.
         AVG(s.text_len) AS avg_text_len
