@@ -1,4 +1,5 @@
 import os
+import time
 import polars as pl
 from hmmlearn import hmm
 import numpy as np
