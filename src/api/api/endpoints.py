@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 def check_data_freshness():
     conn = get_db_connection()
     with conn.cursor() as cur:
-        cur.execute("SELECT MAX(created_at) FROM ta_silver;")
+        cur.execute("SELECT MAX(ingest_time) FROM ta_silver;")
         latest_data = cur.fetchone()[0]
     conn.close()
     if not latest_data or (datetime.now(timezone.utc) - latest_data > timedelta(minutes=15)):

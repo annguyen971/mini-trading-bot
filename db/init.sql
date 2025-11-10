@@ -3,22 +3,29 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TABLE IF NOT EXISTS task_q (
   id BIGSERIAL PRIMARY KEY,
-  kind TEXT NOT NULL,
+  task_type TEXT NOT NULL,   -- 'ta.bar' | 'sa.article'
   payload JSONB NOT NULL,
-  next_run_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  retry_count INT NOT NULL DEFAULT 0,
-  max_retries INT NOT NULL DEFAULT 3,
-  created_at TIMESTAMPTZ DEFAULT now()
+  status TEXT NOT NULL DEFAULT 'ready',
+  priority INT NOT NULL DEFAULT 100,
+  first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_attempt TIMESTAMPTZ
 );
-CREATE INDEX IF NOT EXISTS idx_task_q_next_run_at ON task_q (next_run_at);
+CREATE INDEX IF NOT EXISTS idx_task_q_status ON task_q(status, priority, first_seen) WHERE status = 'ready';
 
-CREATE TABLE IF NOT EXISTS task_q_dlq (LIKE task_q INCLUDING ALL, moved_at TIMESTAMPTZ DEFAULT now());
+CREATE TABLE IF NOT EXISTS task_q_dlq (
+  id BIGSERIAL PRIMARY KEY,
+  task_id BIGINT,
+  reason TEXT NOT NULL,
+  rule_id TEXT,
+  payload JSONB,
+  error_msg TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS control_flags (
-  flag TEXT PRIMARY KEY,
-  enabled BOOL NOT NULL DEFAULT true,
-  reason TEXT,
-  updated_at TIMESTAMPTZ
+  name TEXT PRIMARY KEY,
+  value BOOLEAN NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- (Seed: 'KILL_SWITCH', 'BEGINNER_MODE', 'SCRAPE_SLOW')
 
@@ -48,28 +55,43 @@ CREATE TABLE IF NOT EXISTS ta_silver (
   trade_date DATE NOT NULL,
   open DOUBLE PRECISION NOT NULL,
   high DOUBLE PRECISION NOT NULL,
-  low DOUBLE PRECISION NOT NULL,
+  low  DOUBLE PRECISION NOT NULL,
   close DOUBLE PRECISION NOT NULL,
   volume BIGINT NOT NULL,
-  turnover DOUBLE PRECISION,
-  as_of_time TIMESTAMPTZ NOT NULL,
-  bronze_ref_id UUID REFERENCES raw_bronze(id),
-  validated_at TIMESTAMPTZ DEFAULT now(),
-  PRIMARY KEY (symbol, trade_date)
+  vwap DOUBLE PRECISION,
+  adj_close DOUBLE PRECISION,
+  currency TEXT NOT NULL DEFAULT 'VND',
+  price_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+  source TEXT,
+  first_seen_time TIMESTAMPTZ,
+  ingest_time TIMESTAMPTZ NOT NULL DEFAULT now(),
+  content_hash TEXT,
+  PRIMARY KEY(symbol, trade_date)
 );
 
 CREATE TABLE IF NOT EXISTS sa_silver (
-  url_canonical TEXT PRIMARY KEY,
-  source_name TEXT NOT NULL,
-  publisher_time_utc TIMESTAMPTZ,
-  as_of_time TIMESTAMPTZ NOT NULL,
-  text_norm_hash TEXT NOT NULL,
-  text_len INT NOT NULL,
+  url_canonical TEXT UNIQUE NOT NULL, -- Ưu tiên UNIQUE NOT NULL cho khóa chính
+  source_domain TEXT NOT NULL,
+  publisher_time TIMESTAMPTZ NOT NULL,
+  first_seen_time TIMESTAMPTZ NOT NULL,
   language TEXT,
-  bronze_ref_id UUID REFERENCES raw_bronze(id),
-  validated_at TIMESTAMPTZ DEFAULT now()
+  title TEXT,
+  text_normalized TEXT,
+  content_hash TEXT NOT NULL,
+  symbols TEXT[],
+  author TEXT,
+  topic_tags TEXT[],
+  hype_raw DOUBLE PRECISION,
+  hype_crowd DOUBLE PRECISION,
+  hype_elitist DOUBLE PRECISION,
+  account_weights_applied BOOLEAN,
+  ingest_time TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (url_canonical) -- Đơn giản hóa khóa
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_sa_silver_text_norm_hash ON sa_silver (text_norm_hash);
+-- Chỉ mục (Index)
+CREATE INDEX IF NOT EXISTS idx_sa_silver_pub ON sa_silver(publisher_time);
+CREATE INDEX IF NOT EXISTS idx_sa_silver_symbols ON sa_silver USING GIN (symbols);
+CREATE INDEX IF NOT EXISTS idx_sa_silver_hash_fallback ON sa_silver(source_domain, content_hash);
 
 CREATE TABLE IF NOT EXISTS catalyst_flags (
   sa_silver_ref_id TEXT REFERENCES sa_silver(url_canonical),
@@ -188,6 +210,53 @@ CREATE TABLE IF NOT EXISTS event_log (
 );
 CREATE INDEX IF NOT EXISTS idx_event_log_time ON event_log(event_time);
 CREATE INDEX IF NOT EXISTS idx_event_log_name ON event_log(event_name);
+
+-- (TỪ PRD Story 0.2 AC1)
+CREATE TABLE IF NOT EXISTS macro_raw (
+    id BIGSERIAL PRIMARY KEY,
+    indicator_name TEXT NOT NULL,
+    effective_date DATE NOT NULL,
+    value DOUBLE PRECISION,
+    as_of_time TIMESTAMPTZ NOT NULL,
+    source_name TEXT,
+    content_hash TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS macro_clean (
+    indicator_name TEXT NOT NULL,
+    effective_date DATE NOT NULL,
+    value DOUBLE PRECISION NOT NULL,
+    z_score_36m DOUBLE PRECISION, -- Sẽ được tính bởi Epic 2
+    validated_at TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (indicator_name, effective_date)
+);
+
+CREATE TABLE IF NOT EXISTS macro_index (
+    effective_date DATE PRIMARY KEY,
+    mli_score DOUBLE PRECISION, -- Macro Liquidity Index
+    macro_shock_flag BOOLEAN,
+    feature_set_version TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sector_stats (
+    effective_date DATE NOT NULL,
+    sector_name TEXT NOT NULL,
+    -- (Từ Epic 2)
+    percent_ma20 DOUBLE PRECISION,
+    percent_ma50 DOUBLE PRECISION,
+    momentum_5d DOUBLE PRECISION,
+    momentum_20d DOUBLE PRECISION,
+    PRIMARY KEY (effective_date, sector_name)
+);
+
+CREATE TABLE IF NOT EXISTS dim_macro_sector_impact (
+    factor_name TEXT NOT NULL, -- 'z_cpi', 'z_ib7d', 'z_fx'
+    sector_name TEXT NOT NULL,
+    weight SMALLINT NOT NULL DEFAULT 0, -- (-2, -1, 0, 1, 2)
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (factor_name, sector_name)
+);
 
 -- ==== VIEW AS-OF (BẮT BUỘC) ====
 -- (Logic view sẽ được định nghĩa trong db/views.sql)
