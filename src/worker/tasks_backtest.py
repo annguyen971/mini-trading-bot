@@ -71,9 +71,13 @@ def run_wfo_backtest(conn, champion_version, challenger_version):
     pf_champion = vbt.Portfolio.from_signals(data['close'], champion_signals == 1, champion_signals == 3) # Assuming 1 is buy, 3 is sell
     pf_challenger = vbt.Portfolio.from_signals(data['close'], challenger_signals == 1, challenger_signals == 3)
 
-    # This is a placeholder for IC series calculation
-    ic_series_champion = pd.Series(np.random.normal(0.02, 0.05, size=len(data)))
-    ic_series_challenger = pd.Series(np.random.normal(0.025, 0.05, size=len(data)))
+    # Calculate IC series
+    def calculate_ic(signals, returns):
+        return signals.groupby(level=0).apply(lambda x: stats.spearmanr(x, returns.loc[x.index])[0])
+
+    returns = data['close'].pct_change()
+    ic_series_champion = calculate_ic(pd.Series(champion_signals, index=data.index), returns)
+    ic_series_challenger = calculate_ic(pd.Series(challenger_signals, index=data.index), returns)
 
     metrics = {
         "champion": {"sharpe": pf_champion.sharpe_ratio(), "ic_series": ic_series_champion, "trades": pf_champion.trades.count(), "max_drawdown": pf_champion.max_drawdown()},

@@ -8,5 +8,6 @@ dependencies = [
     "scikit-learn",
     "onnxruntime",
     "vectorbt",
+    "scipy",
     "core-lib @ file://../core_lib",
 ]
