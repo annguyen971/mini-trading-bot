@@ -1,1 +1,0 @@
-50 2 * * * docker exec stock-hunter-ai-worker-1 python -m worker.tasks_train
