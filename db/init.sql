@@ -3,30 +3,24 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TABLE IF NOT EXISTS task_q (
   id BIGSERIAL PRIMARY KEY,
-  task_type TEXT NOT NULL,   -- 'ta.bar' | 'sa.article'
+  kind TEXT NOT NULL,
   payload JSONB NOT NULL,
-  status TEXT NOT NULL DEFAULT 'ready',
-  priority INT NOT NULL DEFAULT 100,
-  first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_attempt TIMESTAMPTZ
+  next_run_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  retry_count INT NOT NULL DEFAULT 0,
+  max_retries INT NOT NULL DEFAULT 3,
+  created_at TIMESTAMPTZ DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_task_q_status ON task_q(status, priority, first_seen) WHERE status = 'ready';
+CREATE INDEX IF NOT EXISTS idx_task_q_next_run_at ON task_q (next_run_at);
 
-CREATE TABLE IF NOT EXISTS task_q_dlq (
-  id BIGSERIAL PRIMARY KEY,
-  task_id BIGINT,
-  reason TEXT NOT NULL,
-  rule_id TEXT,
-  payload JSONB,
-  error_msg TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+CREATE TABLE IF NOT EXISTS task_q_dlq (LIKE task_q INCLUDING ALL, moved_at TIMESTAMPTZ DEFAULT now());
 
 CREATE TABLE IF NOT EXISTS control_flags (
-  name TEXT PRIMARY KEY,
-  value BOOLEAN NOT NULL,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  flag TEXT PRIMARY KEY,
+  enabled BOOL NOT NULL DEFAULT true,
+  reason TEXT,
+  updated_at TIMESTAMPTZ
 );
+-- (Seed: 'KILL_SWITCH', 'BEGINNER_MODE', 'SCRAPE_SLOW')
 
 -- ==== DỮ LIỆU & ĐẶC TRƯNG (CORE) ====
 CREATE TABLE IF NOT EXISTS raw_bronze (
@@ -54,43 +48,28 @@ CREATE TABLE IF NOT EXISTS ta_silver (
   trade_date DATE NOT NULL,
   open DOUBLE PRECISION NOT NULL,
   high DOUBLE PRECISION NOT NULL,
-  low  DOUBLE PRECISION NOT NULL,
+  low DOUBLE PRECISION NOT NULL,
   close DOUBLE PRECISION NOT NULL,
   volume BIGINT NOT NULL,
-  vwap DOUBLE PRECISION,
-  adj_close DOUBLE PRECISION,
-  currency TEXT NOT NULL DEFAULT 'VND',
-  price_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0,
-  source TEXT,
-  first_seen_time TIMESTAMPTZ,
-  ingest_time TIMESTAMPTZ NOT NULL DEFAULT now(),
-  content_hash TEXT,
-  PRIMARY KEY(symbol, trade_date)
+  turnover DOUBLE PRECISION,
+  as_of_time TIMESTAMPTZ NOT NULL,
+  bronze_ref_id UUID REFERENCES raw_bronze(id),
+  validated_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (symbol, trade_date)
 );
 
 CREATE TABLE IF NOT EXISTS sa_silver (
-  url_canonical TEXT UNIQUE NOT NULL, -- Ưu tiên UNIQUE NOT NULL cho khóa chính
-  source_domain TEXT NOT NULL,
-  publisher_time TIMESTAMPTZ NOT NULL,
-  first_seen_time TIMESTAMPTZ NOT NULL,
+  url_canonical TEXT PRIMARY KEY,
+  source_name TEXT NOT NULL,
+  publisher_time_utc TIMESTAMPTZ,
+  as_of_time TIMESTAMPTZ NOT NULL,
+  text_norm_hash TEXT NOT NULL,
+  text_len INT NOT NULL,
   language TEXT,
-  title TEXT,
-  text_normalized TEXT,
-  content_hash TEXT NOT NULL,
-  symbols TEXT[],
-  author TEXT,
-  topic_tags TEXT[],
-  hype_raw DOUBLE PRECISION,
-  hype_crowd DOUBLE PRECISION,
-  hype_elitist DOUBLE PRECISION,
-  account_weights_applied BOOLEAN,
-  ingest_time TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (url_canonical) -- Đơn giản hóa khóa
+  bronze_ref_id UUID REFERENCES raw_bronze(id),
+  validated_at TIMESTAMPTZ DEFAULT now()
 );
--- Chỉ mục (Index)
-CREATE INDEX IF NOT EXISTS idx_sa_silver_pub ON sa_silver(publisher_time);
-CREATE INDEX IF NOT EXISTS idx_sa_silver_symbols ON sa_silver USING GIN (symbols);
-CREATE INDEX IF NOT EXISTS idx_sa_silver_hash_fallback ON sa_silver(source_domain, content_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sa_silver_text_norm_hash ON sa_silver (text_norm_hash);
 
 CREATE TABLE IF NOT EXISTS catalyst_flags (
   sa_silver_ref_id TEXT REFERENCES sa_silver(url_canonical),
