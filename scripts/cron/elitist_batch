@@ -1,0 +1,2 @@
+# (Story 2.2/AC1) Run the Elitist Signal batch job at 02:00 UTC every day.
+0 2 * * * docker compose exec worker python -m worker.tasks_elitist
