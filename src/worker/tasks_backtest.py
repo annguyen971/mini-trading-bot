@@ -62,27 +62,43 @@ def run_wfo_backtest(conn, champion_version, challenger_version):
     # Load data
     data = pd.read_sql(f"SELECT * FROM v_features_asof WHERE symbol IN ({','.join(['%s']*len(symbols))})", conn, params=symbols)
 
-    # Run backtest with vectorbt (simplified)
-    # In a real scenario, you would generate signals from the models and pass them to vectorbt
-    pf_champion = vbt.Portfolio.from_holding(data['close'], init_cash=100)
-    pf_challenger = vbt.Portfolio.from_holding(data['close'].pct_change() * 1.1, init_cash=100) # Challenger has 10% better returns
+    # Generate signals from models
+    X = data.drop(["symbol", "effective_date"], axis=1)
+    champion_signals = champion_model.predict(X)
+    challenger_signals = challenger_model.predict(X)
+
+    # Run backtest with vectorbt
+    pf_champion = vbt.Portfolio.from_signals(data['close'], champion_signals == 1, champion_signals == 3) # Assuming 1 is buy, 3 is sell
+    pf_challenger = vbt.Portfolio.from_signals(data['close'], challenger_signals == 1, challenger_signals == 3)
 
     # This is a placeholder for IC series calculation
     ic_series_champion = pd.Series(np.random.normal(0.02, 0.05, size=len(data)))
     ic_series_challenger = pd.Series(np.random.normal(0.025, 0.05, size=len(data)))
 
     metrics = {
-        "champion": {"sharpe": pf_champion.sharpe_ratio(), "ic_series": ic_series_champion, "trades": pf_champion.trades.count()},
-        "challenger": {"sharpe": pf_challenger.sharpe_ratio(), "ic_series": ic_series_challenger, "trades": pf_challenger.trades.count()}
+        "champion": {"sharpe": pf_champion.sharpe_ratio(), "ic_series": ic_series_champion, "trades": pf_champion.trades.count(), "max_drawdown": pf_champion.max_drawdown()},
+        "challenger": {"sharpe": pf_challenger.sharpe_ratio(), "ic_series": ic_series_challenger, "trades": pf_challenger.trades.count(), "max_drawdown": pf_challenger.max_drawdown()}
     }
 
     return metrics
 
 def calculate_metrics_and_guardrails(metrics):
-    if metrics["challenger"]["trades"] < 200:
-        print("Guardrail failed: Not enough trades.")
-        return None
+    suggestion = "ready_for_canary"
 
+    # Guardrail 1: Minimum trades
+    if metrics["challenger"]["trades"] < 200:
+        suggestion = "rejected_by_guardrail"
+
+    # Hysteresis Guardrail
+    sharpe_diff = metrics["challenger"]["sharpe"] - metrics["champion"]["sharpe"]
+    if sharpe_diff < 0.1:
+        suggestion = "rejected_by_guardrail"
+
+    # Risk Guardrail
+    if metrics["challenger"]["max_drawdown"] > metrics["champion"]["max_drawdown"] * 1.2:
+        suggestion = "rejected_by_guardrail"
+
+    # IC Difference CI
     ic_diff = metrics["challenger"]["ic_series"] - metrics["champion"]["ic_series"]
     se_diff = ic_diff.std() / np.sqrt(len(ic_diff))
     ci_95 = stats.norm.interval(0.95, loc=ic_diff.mean(), scale=se_diff)
@@ -92,20 +108,21 @@ def calculate_metrics_and_guardrails(metrics):
         "ic": metrics["challenger"]["ic_series"].mean(),
         "ic_diff_95_ci_lower": ci_95[0],
         "ic_diff_95_ci_upper": ci_95[1],
-        "trades": metrics["challenger"]["trades"]
+        "trades": metrics["challenger"]["trades"],
+        "max_drawdown": metrics["challenger"]["max_drawdown"]
     }
 
-    return final_metrics
+    return final_metrics, suggestion
 
 import json
 
-def update_model_registry(conn, challenger_version, metrics):
+def update_model_registry(conn, challenger_version, metrics, suggestion):
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE model_registry
-            SET metrics = %s
+            SET metrics = %s, promotion_suggestion = %s
             WHERE model_version = %s;
-        """, (json.dumps(metrics), challenger_version))
+        """, (json.dumps(metrics), suggestion, challenger_version))
 
 def run_backtest_batch():
     lock_name = 'backtest_batch'
@@ -126,11 +143,9 @@ def run_backtest_batch():
             print(f"Starting backtest: Champion={champion}, Challenger={challenger}")
             raw_metrics = run_wfo_backtest(conn, champion, challenger)
 
-            final_metrics = calculate_metrics_and_guardrails(raw_metrics)
-            if not final_metrics:
-                return
+            final_metrics, suggestion = calculate_metrics_and_guardrails(raw_metrics)
 
-            update_model_registry(conn, challenger, final_metrics)
+            update_model_registry(conn, challenger, final_metrics, suggestion)
             conn.commit()
 
         finally:
