@@ -41,6 +41,37 @@ CREATE TABLE IF NOT EXISTS raw_bronze (
 CREATE INDEX IF NOT EXISTS idx_raw_bronze_as_of_time ON raw_bronze (as_of_time);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_bronze_content_hash ON raw_bronze (content_hash);
 
+
+-- ==== DỮ LIỆU "SẠCH" (SILVER) ====
+CREATE TABLE IF NOT EXISTS ta_silver (
+  symbol TEXT NOT NULL,
+  trade_date DATE NOT NULL,
+  open DOUBLE PRECISION NOT NULL,
+  high DOUBLE PRECISION NOT NULL,
+  low DOUBLE PRECISION NOT NULL,
+  close DOUBLE PRECISION NOT NULL,
+  volume BIGINT NOT NULL,
+  turnover DOUBLE PRECISION,
+  as_of_time TIMESTAMPTZ NOT NULL,
+  bronze_ref_id UUID REFERENCES raw_bronze(id),
+  validated_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (symbol, trade_date)
+);
+
+CREATE TABLE IF NOT EXISTS sa_silver (
+  url_canonical TEXT PRIMARY KEY,
+  source_name TEXT NOT NULL,
+  publisher_time_utc TIMESTAMPTZ,
+  as_of_time TIMESTAMPTZ NOT NULL,
+  text_norm_hash TEXT NOT NULL,
+  text_len INT NOT NULL,
+  language TEXT,
+  bronze_ref_id UUID REFERENCES raw_bronze(id),
+  validated_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sa_silver_text_norm_hash ON sa_silver (text_norm_hash);
+
+
 CREATE TABLE IF NOT EXISTS features_gold (
   symbol TEXT NOT NULL,
   effective_date DATE NOT NULL,
