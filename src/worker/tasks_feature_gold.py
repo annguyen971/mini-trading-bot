@@ -149,11 +149,14 @@ def calculate_scores(df: pl.DataFrame) -> pl.DataFrame:
 def atomic_publish(conn, df: pl.DataFrame, version: str):
     tmp_table = f"features_gold_v{version}_tmp"
     serving_table = "features_gold_serving"
-    bak_table = f"features_gold_v{version}_bak"
+    bak_table = f"features_gold_serving_bak_{version}_{int(time.time())}"
 
     with conn.cursor() as cur:
         # Create temporary table
-        cur.execute(f"CREATE TABLE {tmp_table} AS SELECT * FROM {serving_table} WHERE 1=0;")
+        # A more robust solution would be to create the table with the correct schema
+        # if the serving table does not exist.
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {serving_table} (symbol TEXT, effective_date DATE, hmm_state INT, FrothScore REAL, HunterScore REAL, Macro_Impact_Score REAL);")
+        cur.execute(f"CREATE TABLE {tmp_table} (LIKE {serving_table} INCLUDING ALL);")
 
         # Write DataFrame to temporary table
         df.write_database(tmp_table, os.getenv("PG_DSN"), if_exists='append')
@@ -171,10 +174,13 @@ def atomic_publish(conn, df: pl.DataFrame, version: str):
         # Atomically swap tables
         cur.execute(f"""
             BEGIN;
-            ALTER TABLE {serving_table} RENAME TO {bak_table};
+            ALTER TABLE IF EXISTS {serving_table} RENAME TO {bak_table};
             ALTER TABLE {tmp_table} RENAME TO {serving_table};
             COMMIT;
         """)
+
+        # Drop the old backup table
+        cur.execute(f"DROP TABLE IF EXISTS {bak_table};")
 
 # === Main Orchestration Logic ===
 @contextmanager
