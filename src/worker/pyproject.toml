@@ -6,6 +6,7 @@ dependencies = [
     "transformers",
     "snorkel",
     "scikit-learn",
+    "pandas",
     "onnxruntime",
     "vectorbt",
     "scipy",
