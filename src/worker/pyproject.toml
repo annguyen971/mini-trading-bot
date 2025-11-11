@@ -11,5 +11,6 @@ dependencies = [
     "vectorbt",
     "scipy",
     "hmmlearn",
+    "lightgbm",
     "core-lib @ file://../core_lib",
 ]
