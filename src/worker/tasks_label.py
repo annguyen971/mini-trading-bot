@@ -12,8 +12,8 @@ import polars as pl
 from snorkel.labeling import PandasLFApplier
 from snorkel.labeling.model import LabelModel
 
-# Placeholder for core_lib imports
-# from core_lib.db import pg_conn, try_lock
+from core_lib.db import get_db_connection
+from core_lib.locks import get_advisory_lock
 
 # --- Constants ---
 ABSTAIN = -1
@@ -82,7 +82,27 @@ def LF_macro_shock(row):
 
 # --- Main Logic Functions ---
 
-def run_snorkel_labeling(v_features_asof: pl.DataFrame):
+def upsert_silver_labels(conn, df_silver_labels: pl.DataFrame):
+    """UPSERT silver labels into the database."""
+    with conn.cursor() as cursor:
+        cursor.execute("CREATE TEMP TABLE silver_labels_temp (LIKE labels_silver)")
+        with cursor.copy("COPY silver_labels_temp FROM STDIN") as copy:
+            copy.write_polars_csv(df_silver_labels)
+
+        cursor.execute("""
+            INSERT INTO labels_silver
+            SELECT * FROM silver_labels_temp
+            ON CONFLICT (symbol, effective_date) DO UPDATE
+            SET state_snorkel = EXCLUDED.state_snorkel,
+                probability = EXCLUDED.probability,
+                entropy = EXCLUDED.entropy,
+                is_auto_accepted = EXCLUDED.is_auto_accepted,
+                label_model_version = EXCLUDED.label_model_version,
+                lf_fingerprint = EXCLUDED.lf_fingerprint
+        """)
+        logger.info(f"Upserted {cursor.rowcount} silver labels.")
+
+def run_snorkel_labeling(conn, v_features_asof: pl.DataFrame):
     """
     Applies Labeling Functions, trains a LabelModel, and generates silver labels.
     (Implements Story 3.1)
@@ -151,12 +171,12 @@ def run_snorkel_labeling(v_features_asof: pl.DataFrame):
     logger.info("Snorkel labeling process completed.")
     logger.info(f"Generated {df_silver_labels.height} silver labels.")
 
-    # TODO: UPSERT df_silver_labels into the 'labels_silver' table.
+    upsert_silver_labels(conn, df_silver_labels)
 
     return df_silver_labels
 
 
-def run_active_learning_sampling(df_silver_labels: pl.DataFrame, v_features_asof: pl.DataFrame):
+def run_active_learning_sampling(conn, df_silver_labels: pl.DataFrame, v_features_asof: pl.DataFrame):
     """
     Selects uncertain and diverse samples for the Active Learning queue.
     (Implements Story 3.2)
@@ -223,52 +243,61 @@ def run_active_learning_sampling(df_silver_labels: pl.DataFrame, v_features_asof
     logger.info(f"Prepared {df_to_queue.height} samples for AL queue.")
     logger.info("Final samples to be queued:\n" + str(df_to_queue))
 
-    # TODO: INSERT df_to_queue into the 'al_queue' table
-    # using ON CONFLICT (dedup_key) DO NOTHING.
+    insert_al_queue(conn, df_to_queue)
 
     logger.info("Active Learning sampling completed.")
+
+def insert_al_queue(conn, df_to_queue: pl.DataFrame):
+    """INSERT AL candidates into the database."""
+    with conn.cursor() as cursor:
+        cursor.execute("CREATE TEMP TABLE al_queue_temp (LIKE al_queue)")
+        with cursor.copy("COPY al_queue_temp FROM STDIN") as copy:
+            copy.write_polars_csv(df_to_queue)
+
+        cursor.execute("""
+            INSERT INTO al_queue (symbol, effective_date, reason, status, dedup_key)
+            SELECT symbol, effective_date, reason, status, dedup_key FROM al_queue_temp
+            ON CONFLICT (dedup_key) DO NOTHING
+        """)
+        logger.info(f"Inserted {cursor.rowcount} AL candidates.")
 
 
 def main():
     """Main entry point for the labeling batch job."""
-    lock_name = "label_batch"
+    ADVISORY_LOCK_NAME = "label_batch_lock"
 
-    # Using a placeholder for the DB connection context manager
-    # with pg_conn() as conn:
-    #     if not try_lock(conn, lock_name):
-    #         logger.warning(f"Could not acquire lock '{lock_name}'. Exiting.")
-    #         return 0
+    with get_db_connection() as conn:
+        if not get_advisory_lock(conn, ADVISORY_LOCK_NAME):
+            logger.warning(f"Could not acquire lock '{ADVISORY_LOCK_NAME}'. Exiting.")
+            return 0
 
-    try:
-        logger.info("Starting label_batch job.")
+        try:
+            logger.info("Starting label_batch job.")
 
-        # Step 1: Fetch data from the as-of view
-        # This is a placeholder for the actual data fetching logic
-        # v_features_asof = pl.read_sql("SELECT * FROM v_features_asof", conn)
-        v_features_asof = pl.DataFrame({
-            "symbol": ["A", "B", "C"],
-            "effective_date": ["2023-01-01", "2023-01-01", "2023-01-01"]
-        })
+            # Step 1: Fetch data from the as-of view (Story 3.1/AC6)
+            logger.info("Fetching data from v_features_asof...")
+            v_features_asof = pl.read_database("SELECT * FROM v_features_asof", conn)
+            logger.info(f"Fetched {v_features_asof.height} rows from v_features_asof.")
 
-        # Step 2: Run Snorkel to generate silver labels
-        df_silver_labels = run_snorkel_labeling(v_features_asof)
+            # Step 2: Run Snorkel to generate silver labels
+            df_silver_labels = run_snorkel_labeling(conn, v_features_asof)
 
-        # Step 3: Run AL sampling to populate the queue
-        if df_silver_labels.height > 0:
-            run_active_learning_sampling(df_silver_labels, v_features_asof)
-        else:
-            logger.info("No silver labels generated, skipping AL sampling.")
+            # Step 3: Run AL sampling to populate the queue
+            if df_silver_labels.height > 0:
+                run_active_learning_sampling(conn, df_silver_labels, v_features_asof)
+            else:
+                logger.info("No silver labels generated, skipping AL sampling.")
 
-        logger.info("label_batch job completed successfully.")
+            logger.info("label_batch job completed successfully.")
+            conn.commit()
 
-    except Exception as e:
-        logger.error(f"An error occurred in the label_batch job: {e}", exc_info=True)
-        # conn.rollback()
-        return 1
-    finally:
-        # The lock should be released by the context manager
-        logger.info("Exiting label_batch job.")
-        pass
+        except Exception as e:
+            logger.error(f"An error occurred in the label_batch job: {e}", exc_info=True)
+            if conn:
+                conn.rollback()
+            return 1
+        finally:
+            logger.info("Exiting label_batch job.")
 
 if __name__ == "__main__":
     sys.exit(main())
