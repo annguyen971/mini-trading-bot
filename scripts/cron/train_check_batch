@@ -1,0 +1,2 @@
+# Story 4.1/AC1: Run conditional training check at 02:50 daily.
+50 2 * * * docker exec stock-hunter-ai-worker-1 python -m worker.tasks_train
