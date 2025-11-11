@@ -147,3 +147,4 @@ volumes:
   caddy_data:
   artifacts:
   packs:
+  backups: {}

@@ -1,27 +1,7 @@
 from fastapi import FastAPI, Response, status
 from core_lib.db import get_db_connection
-import psycopg
-import json
 
 app = FastAPI()
-
-# --- Helper Functions ---
-def log_event(event_name: str, meta: dict = None):
-    """Helper function to insert an event into the event_log table."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO event_log (event_name, meta) VALUES (%s, %s::jsonb);",
-                (event_name, json.dumps(meta) if meta else None)
-            )
-        conn.commit()
-    except psycopg.Error as e:
-        print(f"Error logging event '{event_name}': {e}")
-    finally:
-        if conn:
-            conn.close()
 
 # --- Placeholder Functions for Readiness Checks ---
 
@@ -113,36 +93,3 @@ def readyz(response: Response):
         print(f"Readiness check failed: {e}")
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return {"status": "not_ready", "detail": str(e)}
-
-# --- UI Endpoints ---
-from pydantic import BaseModel
-from typing import List, Optional
-from datetime import date
-from fastapi import Header, Depends, HTTPException
-
-async def verify_admin_key(x_admin_key: str = Header(...)):
-    if x_admin_key != "default_key":
-        raise HTTPException(status_code=401, detail="Invalid Admin Key")
-
-class LabelSubmission(BaseModel):
-    symbol: str
-    effective_date: date
-    old_label: int
-    new_label: int
-    is_sandbox: bool = False
-
-@app.get("/export/context", dependencies=[Depends(verify_admin_key)])
-def export_context(format: str = "md"):
-    log_event("ai_copy_md", {"format": format})
-    return Response(content="# Dummy Context", media_type="text/markdown")
-
-@app.get("/export/pack", dependencies=[Depends(verify_admin_key)])
-def export_pack():
-    log_event("ai_pack_dl")
-    return Response(content=b"dummy zip", media_type="application/zip")
-
-@app.post("/al/label", status_code=201, dependencies=[Depends(verify_admin_key)])
-def submit_al_label(label: LabelSubmission):
-    log_event("al_decide", {"symbol": label.symbol, "is_sandbox": label.is_sandbox})
-    # Dummy response, as the DB logic is not part of this task's scope
-    return {"status": "Label submitted"}
