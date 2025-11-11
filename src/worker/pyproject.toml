@@ -7,5 +7,8 @@ dependencies = [
     "snorkel",
     "scikit-learn",
     "onnxruntime",
+    "vectorbt",
+    "scipy",
+    "hmmlearn",
     "core-lib @ file://../core_lib",
 ]
