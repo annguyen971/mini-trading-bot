@@ -21,7 +21,7 @@ def get_active_canary_and_champion():
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             # Find a model marked as 'canary'
-            cur.execute("SELECT model_version FROM model_registry WHERE is_active = 'canary' LIMIT 1;")
+            cur.execute("SELECT model_version FROM model_registry WHERE promotion_suggestion = 'canary_active' LIMIT 1;")
             canary = cur.fetchone()
 
             # Find the main production model

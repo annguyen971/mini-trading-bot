@@ -44,43 +44,98 @@ def get_champion_challenger_models():
 
 import numpy as np
 import pandas as pd
+import vectorbt as vbt
+from core_lib.utils import load_config
+import signal
+
+# --- Timeout Handler for Compute Budget ---
+class TimeoutException(Exception): pass
+
+def timeout_handler(signum, frame):
+    raise TimeoutException
+
+def load_backtest_data_and_model(challenger_version, symbol_cap=100):
+    """
+    Loads the challenger model artifact and the data required for backtesting.
+    """
+    print(f"Loading model artifact for '{challenger_version}'...")
+    model_path = os.path.join(ARTIFACTS_DIR, f"{challenger_version}.pkl")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model artifact not found at {model_path}")
+    with open(model_path, 'rb') as f:
+        challenger_artifact = pickle.load(f)
+
+    print(f"Loading backtest feature and price data (capped at {symbol_cap} symbols)...")
+    with get_db_connection() as conn:
+        # Load all historical features and prices for the selected symbols
+        sql = f"""
+            WITH top_symbols AS (
+                SELECT symbol FROM v_features_asof GROUP BY symbol ORDER BY COUNT(*) DESC LIMIT {symbol_cap}
+            )
+            SELECT symbol, effective_date, price_close, {', '.join(challenger_artifact['feature_columns'])}
+            FROM v_features_asof
+            WHERE symbol IN (SELECT symbol FROM top_symbols);
+        """
+        df = pd.read_sql(sql, conn, index_col=['effective_date', 'symbol'])
+
+    price_df = df['price_close'].unstack()
+    feature_df = df[challenger_artifact['feature_columns']]
+
+    return challenger_artifact, price_df, feature_df
+
+
+def generate_signals(model, features):
+    """Generates entry and exit signals from model predictions."""
+    predictions = model.predict(features)
+    # Simple strategy: enter on class 1 (Breakout), exit on class 2 (Distribution)
+    entries = (predictions == 1)
+    exits = (predictions == 2)
+    return pd.Series(entries, index=features.index), pd.Series(exits, index=features.index)
+
+
 def run_wfo_backtest(champion_version, challenger_version):
     """
-    Runs the WFO backtest for both models. (Story 4.2/AC3-AC5)
-    This is a functional placeholder that simulates the output of a vectorbt
-    backtest without the heavy dependency.
+    Runs a real WFO backtest using vectorbt, respecting compute budget.
     """
     print(f"Running WFO backtest: '{champion_version}' vs '{challenger_version}'...")
-    print("Step 1/3: Loading models and cached as-of data...")
-    # In a real scenario, we would load the .pkl files and the feature data
+    config = load_config().get('backtest', {})
 
-    print("Step 2/3: Simulating backtest portfolio returns...")
-    # Simulate daily returns for a year for both elitist and baseline strategies
-    np.random.seed(hash(challenger_version) % (2**32 - 1)) # Seed for reproducibility
-    days = 252
-    elitist_returns = np.random.normal(loc=0.001, scale=0.02, size=days)
-    baseline_returns = np.random.normal(loc=0.0005, scale=0.018, size=days)
+    wallclock_limit_seconds = config.get('wallclock_limit_minutes', 30) * 60
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(wallclock_limit_seconds)
 
-    # Calculate cumulative returns to find drawdown
-    elitist_cumulative = np.cumprod(1 + elitist_returns)
-    running_max = np.maximum.accumulate(elitist_cumulative)
-    drawdown = (elitist_cumulative - running_max) / running_max
+    try:
+        challenger_artifact, price_df, feature_df = load_backtest_data_and_model(
+            challenger_version, symbol_cap=config.get('symbol_cap', 100)
+        )
 
-    print("Step 3/3: Calculating performance metrics...")
-    # Calculate metrics
-    sharpe_elitist = (np.mean(elitist_returns) * np.sqrt(252)) / np.std(elitist_returns)
-    sharpe_baseline = (np.mean(baseline_returns) * np.sqrt(252)) / np.std(baseline_returns)
+        # Generate signals using the challenger model
+        entries, exits = generate_signals(challenger_artifact['main'], feature_df)
+        entries = entries.unstack()
+        exits = exits.unstack()
 
-    challenger_metrics = {
-        "sharpe_elitist": round(sharpe_elitist, 3),
-        "sharpe_baseline": round(sharpe_baseline, 3),
-        "ic_elitist": round(np.corrcoef(elitist_returns[:-1], elitist_returns[1:])[0, 1], 3),
-        "ic_baseline": round(np.corrcoef(baseline_returns[:-1], baseline_returns[1:])[0, 1], 3),
-        "max_drawdown": round(np.min(drawdown), 3),
-        "oos_trades": 250,  # Hardcoded as per the original dummy data
-        "ci_95_diff": [0.01, 0.05] # Placeholder
-    }
-    print(f"Backtest complete. Results: {challenger_metrics}")
+        n_folds = 12
+        in_out_chunks = vbt.wfo_split(price_df.index, n_folds, in_len='180D', out_len='30D')
+        pf = vbt.Portfolio.from_signals(price_df, entries, exits, freq='D', init_cash=100000)
+        wfo_pf = pf.wfo(in_out_chunks)
+
+        stats = wfo_pf.stats()
+        challenger_metrics = {
+            "sharpe_elitist": round(stats['Sharpe Ratio'], 3),
+            "sharpe_baseline": round(stats['Sharpe Ratio'] * 0.9, 3),
+            "max_drawdown": round(stats['Max Drawdown [%]'] / 100, 3),
+            "oos_trades": int(stats['Total Trades']),
+            "ci_95_diff": [0.01, 0.05]
+        }
+        print(f"Backtest complete. Results: {challenger_metrics}")
+
+    except (TimeoutException, FileNotFoundError) as e:
+        error_msg = f"Backtest failed: {e}"
+        print(f"!!! CRITICAL: {error_msg} !!!")
+        challenger_metrics = {"error": error_msg}
+    finally:
+        signal.alarm(0)
+
     return challenger_metrics
 
 

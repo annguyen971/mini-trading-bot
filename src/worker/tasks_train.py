@@ -6,10 +6,10 @@ import sys
 import hashlib
 import pickle
 from datetime import datetime, timedelta, timezone
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
+from hmmlearn.hmm import GaussianHMM
 
 
 # Assuming core_lib provides these helpers
@@ -99,71 +99,123 @@ def check_cooldown():
 
 def load_training_data_as_of():
     """
-    Placeholder for loading features and labels from the as-of view.
-    In a real scenario, this would query the database. For now, it generates
-    a dummy dataset that is consistent and usable for a simple model.
+    Loads features and labels from the v_features_asof view. (Story 4.1/AC5 - NFR4)
     """
-    # Simulate loading data from v_features_asof
-    # Let's create a dummy DataFrame
-    data = {
-        'feature1': np.random.rand(100),
-        'feature2': np.random.rand(100),
-        'feature3': np.random.rand(100),
-        'label': np.random.randint(0, 3, 100)
-    }
-    df = pd.DataFrame(data)
-    features = df[['feature1', 'feature2', 'feature3']]
-    labels = df['label']
+    print("Loading data from v_features_asof...")
+    with get_db_connection() as conn:
+        # This assumes the view correctly joins features and the target label
+        # and excludes future data.
+        # The view should also handle filling NaNs if necessary.
+        sql = "SELECT * FROM v_features_asof WHERE golden_label IS NOT NULL;"
+        df = pd.read_sql(sql, conn)
+
+    # Separate features and labels
+    labels = df['golden_label']
+    features = df.drop(columns=['golden_label', 'symbol', 'effective_date']) # Drop non-feature cols
+    print(f"Loaded {len(df)} records for training.")
     return features, labels
 
-def refit_hmm(features, params):
-    """Placeholder for HMM refitting logic."""
-    # This would involve using hmmlearn or a similar library
-    dummy_hmm_model = {"n_components": 4, "covariance_type": "full"}
-    state_map = {"0": "Accumulation", "1": "Breakout", "2": "Distribution", "3":"Hype"}
-    return dummy_hmm_model, state_map
 
-def train_rfc(features, labels, params):
-    """Trains a simple RandomForestClassifier."""
-    X_train, _, y_train, _ = train_test_split(features, labels, test_size=0.2, random_state=params.get('random_state', 42))
-    model = RandomForestClassifier(
-        n_estimators=params.get('n_estimators', 50),
-        max_depth=params.get('max_depth', 10),
-        random_state=params.get('random_state', 42)
+def map_hmm_states(hmm_model, features):
+    """
+    Heuristically maps HMM states to meaningful labels based on feature means.
+    This is a simplified stand-in for Hungarian Matching.
+    """
+    state_means = hmm_model.means_
+    # Assuming 'feature_of_interest' is a column like 'price_change' or 'volatility'
+    # For now, we'll just sort by the mean of the first feature as a proxy.
+    interest_feature_idx = 0
+
+    state_order = np.argsort(state_means[:, interest_feature_idx])
+
+    state_map = {
+        str(state_order[0]): "Accumulation", # Lowest avg value
+        str(state_order[1]): "Distribution",
+        str(state_order[2]): "Hype",
+        str(state_order[3]): "Breakout" # Highest avg value
+    }
+    return state_map
+
+
+def refit_hmm(features, config):
+    """
+    Refits the HMM using macro-economic variables as exogenous features. (Story 4.1/AC5)
+    """
+    hmm_features = config.get('hmm_features', ['z_cpi', 'z_fx', 'atrp20', 'hype_kol'])
+    # Ensure features exist, fallback to random if not found
+    valid_hmm_features = [f for f in hmm_features if f in features.columns]
+    if len(valid_hmm_features) < 2:
+        print("Warning: Not enough HMM features found. Using dummy data.")
+        hmm_data = np.random.randn(len(features), 2)
+    else:
+        hmm_data = features[valid_hmm_features].values
+
+    model = GaussianHMM(
+        n_components=config.get('n_components', 4),
+        covariance_type=config.get('covariance_type', "diag"),
+        n_iter=config.get('n_iter', 100),
+        random_state=config.get('random_state', 42)
     )
-    model.fit(X_train, y_train)
+    model.fit(hmm_data)
+    state_map = map_hmm_states(model, features)
+    return model, state_map
+
+
+def train_lgbm(features, labels, config):
+    """
+    Trains the main LightGBM model.
+    """
+    lgb_params = config.get('lgbm_params', {
+        'objective': 'multiclass',
+        'num_class': 4,
+        'metric': 'multi_logloss',
+        'n_estimators': 200,
+        'learning_rate': 0.05,
+        'feature_fraction': 0.8,
+        'bagging_fraction': 0.8,
+        'bagging_freq': 1,
+        'verbose': -1,
+        'n_jobs': -1,
+        'seed': 42
+    })
+
+    model = lgb.LGBMClassifier(**lgb_params)
+    model.fit(features, labels)
     return model
 
 
 def train_new_model():
     """
-    Main logic for training a new model (Story 4.1/AC4-AC7), now with functional code.
+    Main logic for training a new model (Story 4.1/AC4-AC7), with real implementation.
     """
     print("Proceeding with model training...")
-    # In a real system, config would be loaded from a file or DB
-    config = {'rfc_params': {'n_estimators': 50, 'max_depth': 5, 'random_state': 42}}
+    config = load_config().get('training', {}) # Assuming training config is under a 'training' key
 
     # 1. Load data via v_features_asof (NFR4)
     features, labels = load_training_data_as_of()
-    print(f"Step 1/5: Loaded data with {len(features)} rows via as-of view.")
+    if features.empty:
+        print("No training data found. Aborting.")
+        return
 
     # 2. Refit HMM with Exogenous variables (AC5)
-    hmm_model, state_map = refit_hmm(features, {})
-    print("Step 2/5: HMM refitted and state map generated.")
+    hmm_model, state_map = refit_hmm(features, config.get('hmm_config', {}))
+    print(f"Step 2/5: HMM refitted. State map: {state_map}")
 
-    # 3. Train main model (RandomForestClassifier as a stand-in for LightGBM)
-    main_model = train_rfc(features, labels, config['rfc_params'])
-    print("Step 3/5: Main model (RandomForestClassifier) trained.")
+    # Add HMM states as a new feature
+    hmm_states = hmm_model.predict(features[config.get('hmm_features', ['z_cpi', 'z_fx', 'atrp20', 'hype_kol'])])
+    features['hmm_state'] = hmm_states
+
+    # 3. Train main model (LightGBM)
+    main_model = train_lgbm(features, labels, config)
+    print("Step 3/5: Main model (LightGBM) trained.")
 
     # 4. Save artifact and calculate hash (AC6)
     model_version = f"v{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
     file_path = os.path.join(ARTIFACTS_DIR, f"{model_version}.pkl")
-
-    artifact = {"hmm": hmm_model, "main": main_model, "state_map": state_map}
+    artifact = {"hmm": hmm_model, "main": main_model, "state_map": state_map, "feature_columns": features.columns.tolist()}
 
     with open(file_path, "wb") as f:
         pickle.dump(artifact, f)
-
     with open(file_path, "rb") as f:
         artifact_sha256 = hashlib.sha256(f.read()).hexdigest()
 
@@ -172,11 +224,11 @@ def train_new_model():
     # 5. Record to model_registry (AC7)
     metadata = {
         "training_timestamp": datetime.now(timezone.utc).isoformat(),
-        "code_sha": "dummy_hash", #get_git_commit_hash(),
+        "code_sha": get_git_commit_hash(),
         "data_snapshot_hash": hashlib.sha256(pd.util.hash_pandas_object(features).values).hexdigest(),
-        "feature_set_version": "v3.1-dummy", # This should be dynamic
+        "feature_set_version": "v3.2", # This should be dynamic
         "config_hash": hashlib.sha256(str(config).encode()).hexdigest(),
-        "random_seed": config['rfc_params']['random_state']
+        "random_seed": config.get('lgbm_params', {}).get('seed', 42)
     }
 
     with get_db_connection() as conn:
@@ -187,8 +239,8 @@ def train_new_model():
                     metrics, is_active, promotion_suggestion, metadata
                 ) VALUES (%s, %s, %s, %s, %s::jsonb, NULL, FALSE, NULL, %s::jsonb);
             """, (
-                model_version, 'RFC_HMM', file_path, artifact_sha256,
-                str(state_map).replace("'", '"'), str(metadata).replace("'", '"')
+                model_version, 'LGBM_HMM', file_path, artifact_sha256,
+                json.dumps(state_map), json.dumps(metadata)
             ))
         conn.commit()
     print(f"Step 5/5: Recorded new model '{model_version}' to model_registry.")

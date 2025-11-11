@@ -1,2 +1,2 @@
 # Story 4.3/AC6: Run canary monitoring hourly.
-0 * * * * docker exec stock-hunter-ai-worker-1 python -m worker.tasks_monitor
+0 * * * * docker compose exec worker python -m worker.tasks_monitor
