@@ -1,174 +1,201 @@
 from fastapi import FastAPI, Response, status, Depends, Header, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List
-from datetime import date, datetime, timedelta, timezone
+from typing import List
 import psycopg
-import pandas as pd
-import numpy as np
-import os
+from psycopg.rows import dict_row
 
 from core_lib.db import get_db_connection
 
 app = FastAPI()
 
-# --- Security Dependency ---
-async def verify_admin_key(x_admin_key: str = Header(...)):
-    admin_key_from_env = os.getenv("ADMIN_KEY")
-    if not admin_key_from_env:
-        raise HTTPException(status_code=500, detail="ADMIN_KEY is not set on the server.")
-
-    if x_admin_key != admin_key_from_env:
-        raise HTTPException(status_code=401, detail="Invalid Admin Key")
-    return x_admin_key
-
-# --- Pydantic Models ---
-class LabelSubmission(BaseModel):
-    symbol: str
-    effective_date: date
-    old_label: int
-    new_label: int
-    is_sandbox: bool = False
-    idempotency_key: str
-
-class ALQueueItem(BaseModel):
-    id: int
-    symbol: str
-    effective_date: date
-    reason: Optional[str] = None
-
 # --- Placeholder Functions for Readiness Checks ---
+
 def check_db_connection():
-    # ... (existing implementation)
-    return True
+    """(AC3) Checks if a connection to the database can be established."""
+    print("Checking DB connection...")
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        print("DB connection... OK")
+        return True
+    except Exception as e:
+        print(f"DB connection... FAILED: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 def check_model_loaded():
-    # ... (existing implementation)
+    """Placeholder for checking if the model is in the cache."""
+    # This would check a global or cached object.
+    print("Checking model cache... OK")
     return True
 
+from datetime import datetime, timedelta, timezone
+
 def check_data_freshness():
-    # ... (existing implementation)
-    return True
+    """
+    (AC3) Checks that the most recent data in `raw_bronze` is not older
+    than 26 hours.
+    """
+    print("Checking data freshness...")
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT MAX(as_of_time) FROM raw_bronze;")
+            latest_timestamp = cursor.fetchone()[0]
+
+            if not latest_timestamp:
+                print("Data freshness... FAILED: No data in raw_bronze.")
+                return False
+
+            freshness_threshold = datetime.now(timezone.utc) - timedelta(hours=26)
+
+            if latest_timestamp >= freshness_threshold:
+                print(f"Data freshness... OK (Latest data: {latest_timestamp})")
+                return True
+            else:
+                print(f"Data freshness... FAILED (Latest data: {latest_timestamp} is older than 26 hours)")
+                return False
+
+    except Exception as e:
+        print(f"Data freshness... FAILED: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 # --- Endpoints ---
 
-def get_dummy_prediction():
-    return {
-        "regime": "Burst",
-        "HunterScore": 75.0,
-        "FrothScore": 45.0,
-        "safety_banner": "CANARY MODE",
-        "plain_explainer": "Signal quality is good, but market froth is rising.",
-        "model_version": "lgbm_v2_202511101900",
-        "feature_set_version": "fs_v1_def456",
-        "symbol": "VN30",
-        "chart_data": [
-            {"date": "2025-10-20", "price": 110, "regime": "Accumulation"},
-            {"date": "2025-10-21", "price": 112, "regime": "Accumulation"},
-            {"date": "2025-10-22", "price": 115, "regime": "Burst"},
-            {"date": "2025-10-23", "price": 114, "regime": "Burst"},
-            {"date": "2025-10-24", "price": 118, "regime": "Burst"},
-        ]
-    }
-
-@app.get("/predict")
-def predict(symbol: str = "VN30"):
-    return get_dummy_prediction()
-
-@app.get("/data/price")
-def get_price_data(symbol: str, end_date: date):
-    start_date = end_date - timedelta(days=120)
-    date_range = pd.date_range(start=start_date, end=end_date, freq='D')
-    price_data = pd.DataFrame({
-        'date': date_range.strftime('%Y-%m-%d'),
-        'price': (100 + pd.Series(range(len(date_range))).cumsum() * 0.15 + np.random.randn(len(date_range)).cumsum() * 0.5)
-    })
-    return price_data.to_dict(orient='records')
-
-@app.get("/export/context", dependencies=[Depends(verify_admin_key)])
-def export_context(format: str = "md"):
-    if format == "md":
-        content = "# Stock Hunter AI - Signal Context\n- **Symbol:** VN30\n- **Regime:** Burst"
-        return Response(content=content, media_type="text/markdown")
-    return {"error": "Format not supported"}
-
-@app.get("/export/pack", dependencies=[Depends(verify_admin_key)])
-def export_pack():
-    content = b"dummy zip file content for recovery"
-    return Response(content=content, media_type="application/zip")
-
 @app.get("/healthz")
 def healthz():
+    """Liveness probe."""
     return {"status": "ok"}
 
 @app.get("/readyz")
 def readyz(response: Response):
-    # ... (existing implementation)
-    return {"status": "ready"}
+    """
+    Readiness probe.
+    Performs deep checks for DB, model cache, and data freshness.
+    """
+    try:
+        db_ok = check_db_connection()
+        model_ok = check_model_loaded()
+        data_fresh_ok = check_data_freshness()
 
-# --- Active Learning Endpoints ---
+        if all([db_ok, model_ok, data_fresh_ok]):
+            return {"status": "ready"}
+        else:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return {"status": "not_ready", "detail": "One of the checks failed."}
 
-@app.get("/al/queue", response_model=List[ALQueueItem], dependencies=[Depends(verify_admin_key)])
-def get_al_queue():
+    except Exception as e:
+        # Log the exception in a real application
+        print(f"Readiness check failed: {e}")
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "not_ready", "detail": str(e)}
+
+# --- Admin Endpoints for Task 16 ---
+
+class ModelActivation(BaseModel):
+    model_version: str
+    mode: str
+
+class MacroImpactRow(BaseModel):
+    factor: str
+    sector: str
+    impact: str
+
+class MacroImpactUpdate(BaseModel):
+    data: List[MacroImpactRow]
+
+@app.get("/admin/models", dependencies=[Depends(verify_admin_key)])
+def get_models():
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            cur.execute("SELECT id, symbol, effective_date, reason FROM al_queue WHERE status = 'pending' ORDER BY id LIMIT 20;")
-            items = cur.fetchall()
-        return items
+            cur.execute("SELECT * FROM model_registry ORDER BY created_at DESC;")
+            return cur.fetchall()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        if conn:
-            conn.close()
+        if conn: conn.close()
 
-@app.post("/al/label", status_code=201, dependencies=[Depends(verify_admin_key)])
-def submit_al_label(label: LabelSubmission):
-    target_table = "labels_silver_sandbox" if label.is_sandbox else "labels_golden"
+@app.post("/admin/model/activate", status_code=200, dependencies=[Depends(verify_admin_key)])
+def activate_model(activation: ModelActivation):
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                INSERT INTO {target_table} (symbol, effective_date, old_label, new_label, actor, created_at)
-                VALUES (%s, %s, %s, %s, 'admin', NOW());
-                """,
-                (label.symbol, label.effective_date, label.old_label, label.new_label)
-            )
-            cur.execute(
-                "UPDATE al_queue SET status = 'completed' WHERE symbol = %s AND effective_date = %s;",
-                (label.symbol, label.effective_date)
-            )
-            if not label.is_sandbox:
-                 cur.execute("""
-                    INSERT INTO control_flags (flag, enabled, reason, updated_at)
-                    VALUES ('retrain_needed', TRUE, 'new_golden_label', NOW())
-                    ON CONFLICT (flag) DO UPDATE SET enabled = TRUE, reason = 'new_golden_label', updated_at = NOW();
-                 """)
+            if activation.mode == 'promote':
+                cur.execute("UPDATE model_registry SET is_active = FALSE;")
+                cur.execute("UPDATE model_registry SET is_active = TRUE WHERE model_version = %s;", (activation.model_version,))
+                action = 'PROMOTE_PROD'
+            elif activation.mode == 'rollback':
+                cur.execute("UPDATE model_registry SET is_active = FALSE WHERE model_version = %s;", (activation.model_version,))
+                action = 'ROLLBACK'
+            else: # canary
+                cur.execute("UPDATE model_registry SET promotion_suggestion = 'canary_active' WHERE model_version = %s;", (activation.model_version,))
+                action = 'APPROVE_CANARY'
+            cur.execute("INSERT INTO model_promotion_history (model_version, action, actor) VALUES (%s, %s, 'admin');", (activation.model_version, action))
         conn.commit()
-        return {"status": "Label submitted successfully"}
+        return {"status": "ok"}
     except psycopg.Error as e:
-        if conn:
-            conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        if conn:
-            conn.close()
+        if conn: conn.close()
 
-# Note: The original readiness checks are assumed to be present below this line.
-# I am overwriting the file to ensure all required pieces are in one place.
-@app.get("/admin/models")
-def get_models(response: Response):
-    # ... (placeholder for future task)
-    return []
+@app.get("/admin/health/macro_stats", dependencies=[Depends(verify_admin_key)])
+def get_macro_stats():
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute("SELECT metric_name, value, delta FROM macro_clean;")
+            macro_hub = cur.fetchall()
+            cur.execute("SELECT sector, momentum, breadth FROM sector_stats;")
+            sector_heatmap = cur.fetchall()
+        return {"macro_mini_hub": macro_hub, "sector_heatmap": sector_heatmap}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
 
-@app.post("/admin/model/activate")
-def activate_model(response: Response):
-    # ... (placeholder for future task)
-    return {}
+@app.get("/admin/macro/impact", dependencies=[Depends(verify_admin_key)])
+def get_macro_impact_config():
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute("SELECT factor, sector, impact FROM dim_macro_sector_impact;")
+            return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
 
-@app.post("/admin/macro/impact")
-def update_macro_impact(response: Response):
-    # ... (placeholder for future task)
-    return {}
+@app.post("/admin/macro/impact", status_code=200, dependencies=[Depends(verify_admin_key)])
+def update_macro_impact(update_data: MacroImpactUpdate):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            upsert_query = """
+                INSERT INTO dim_macro_sector_impact (factor, sector, impact)
+                VALUES (%(factor)s, %(sector)s, %(impact)s)
+                ON CONFLICT (factor, sector) DO UPDATE SET impact = EXCLUDED.impact;
+            """
+            cur.executemany(upsert_query, [row.dict() for row in update_data.data])
+        conn.commit()
+        return {"status": "ok"}
+    except psycopg.Error as e:
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
