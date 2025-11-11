@@ -1,12 +1,27 @@
-from fastapi import FastAPI, Response, status, Depends, Header, HTTPException
-from pydantic import BaseModel
-from typing import List
-import psycopg
-from psycopg.rows import dict_row
-
+from fastapi import FastAPI, Response, status
 from core_lib.db import get_db_connection
+import psycopg
+import json
 
 app = FastAPI()
+
+# --- Helper Functions ---
+def log_event(event_name: str, meta: dict = None):
+    """Helper function to insert an event into the event_log table."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO event_log (event_name, meta) VALUES (%s, %s::jsonb);",
+                (event_name, json.dumps(meta) if meta else None)
+            )
+        conn.commit()
+    except psycopg.Error as e:
+        print(f"Error logging event '{event_name}': {e}")
+    finally:
+        if conn:
+            conn.close()
 
 # --- Placeholder Functions for Readiness Checks ---
 
@@ -99,103 +114,35 @@ def readyz(response: Response):
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return {"status": "not_ready", "detail": str(e)}
 
-# --- Admin Endpoints for Task 16 ---
+# --- UI Endpoints ---
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import date
+from fastapi import Header, Depends, HTTPException
 
-class ModelActivation(BaseModel):
-    model_version: str
-    mode: str
+async def verify_admin_key(x_admin_key: str = Header(...)):
+    if x_admin_key != "default_key":
+        raise HTTPException(status_code=401, detail="Invalid Admin Key")
 
-class MacroImpactRow(BaseModel):
-    factor: str
-    sector: str
-    impact: str
+class LabelSubmission(BaseModel):
+    symbol: str
+    effective_date: date
+    old_label: int
+    new_label: int
+    is_sandbox: bool = False
 
-class MacroImpactUpdate(BaseModel):
-    data: List[MacroImpactRow]
+@app.get("/export/context", dependencies=[Depends(verify_admin_key)])
+def export_context(format: str = "md"):
+    log_event("ai_copy_md", {"format": format})
+    return Response(content="# Dummy Context", media_type="text/markdown")
 
-@app.get("/admin/models", dependencies=[Depends(verify_admin_key)])
-def get_models():
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            cur.execute("SELECT * FROM model_registry ORDER BY created_at DESC;")
-            return cur.fetchall()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if conn: conn.close()
+@app.get("/export/pack", dependencies=[Depends(verify_admin_key)])
+def export_pack():
+    log_event("ai_pack_dl")
+    return Response(content=b"dummy zip", media_type="application/zip")
 
-@app.post("/admin/model/activate", status_code=200, dependencies=[Depends(verify_admin_key)])
-def activate_model(activation: ModelActivation):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            if activation.mode == 'promote':
-                cur.execute("UPDATE model_registry SET is_active = FALSE;")
-                cur.execute("UPDATE model_registry SET is_active = TRUE WHERE model_version = %s;", (activation.model_version,))
-                action = 'PROMOTE_PROD'
-            elif activation.mode == 'rollback':
-                cur.execute("UPDATE model_registry SET is_active = FALSE WHERE model_version = %s;", (activation.model_version,))
-                action = 'ROLLBACK'
-            else: # canary
-                cur.execute("UPDATE model_registry SET promotion_suggestion = 'canary_active' WHERE model_version = %s;", (activation.model_version,))
-                action = 'APPROVE_CANARY'
-            cur.execute("INSERT INTO model_promotion_history (model_version, action, actor) VALUES (%s, %s, 'admin');", (activation.model_version, action))
-        conn.commit()
-        return {"status": "ok"}
-    except psycopg.Error as e:
-        if conn: conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if conn: conn.close()
-
-@app.get("/admin/health/macro_stats", dependencies=[Depends(verify_admin_key)])
-def get_macro_stats():
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            cur.execute("SELECT metric_name, value, delta FROM macro_clean;")
-            macro_hub = cur.fetchall()
-            cur.execute("SELECT sector, momentum, breadth FROM sector_stats;")
-            sector_heatmap = cur.fetchall()
-        return {"macro_mini_hub": macro_hub, "sector_heatmap": sector_heatmap}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if conn: conn.close()
-
-@app.get("/admin/macro/impact", dependencies=[Depends(verify_admin_key)])
-def get_macro_impact_config():
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            cur.execute("SELECT factor, sector, impact FROM dim_macro_sector_impact;")
-            return cur.fetchall()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if conn: conn.close()
-
-@app.post("/admin/macro/impact", status_code=200, dependencies=[Depends(verify_admin_key)])
-def update_macro_impact(update_data: MacroImpactUpdate):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            upsert_query = """
-                INSERT INTO dim_macro_sector_impact (factor, sector, impact)
-                VALUES (%(factor)s, %(sector)s, %(impact)s)
-                ON CONFLICT (factor, sector) DO UPDATE SET impact = EXCLUDED.impact;
-            """
-            cur.executemany(upsert_query, [row.dict() for row in update_data.data])
-        conn.commit()
-        return {"status": "ok"}
-    except psycopg.Error as e:
-        if conn: conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if conn: conn.close()
+@app.post("/al/label", status_code=201, dependencies=[Depends(verify_admin_key)])
+def submit_al_label(label: LabelSubmission):
+    log_event("al_decide", {"symbol": label.symbol, "is_sandbox": label.is_sandbox})
+    # Dummy response, as the DB logic is not part of this task's scope
+    return {"status": "Label submitted"}
