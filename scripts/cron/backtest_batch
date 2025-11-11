@@ -1,0 +1,4 @@
+# Story 4.2/AC1: Run WFO backtest weekly (Sunday at 03:00).
+# Important: Uses 'docker compose run' to spin up the worker_bt service
+# on the 'backtest' profile. The '--rm' flag is implicit and cleans up the container.
+0 3 * * 0 docker compose --profile backtest run worker_bt python -m worker.tasks_backtest
