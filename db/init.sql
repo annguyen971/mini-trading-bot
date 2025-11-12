@@ -191,3 +191,64 @@ CREATE INDEX IF NOT EXISTS idx_event_log_name ON event_log(event_name);
 
 -- ==== VIEW AS-OF (BẮT BUỘC) ====
 -- (Logic view sẽ được định nghĩa trong db/views.sql)
+
+-- (Point 1) Bảng sector, nguồn chân lý cho các ngành
+CREATE TABLE IF NOT EXISTS dim_sector (
+    sector text PRIMARY KEY,
+    display_name text
+);
+
+-- (Point 2) Bảng lịch giao dịch, thay thế cho generate_series
+CREATE TABLE IF NOT EXISTS trade_calendar (
+    tdate date PRIMARY KEY,
+    is_trading boolean NOT NULL
+);
+
+-- (Point 1) Bảng lịch công bố dữ liệu vĩ mô
+CREATE TABLE IF NOT EXISTS macro_release_calendar (
+    metric text NOT NULL,
+    period_date date NOT NULL,
+    published_on date NOT NULL,
+    lag_days int NOT NULL DEFAULT 1,
+    PRIMARY KEY (metric, period_date)
+);
+CREATE INDEX IF NOT EXISTS idx_release_metric_period ON macro_release_calendar(metric, period_date);
+CREATE INDEX IF NOT EXISTS idx_release_published ON macro_release_calendar(published_on);
+
+-- (Point 1) Bảng hiệu suất ngành
+CREATE TABLE IF NOT EXISTS sector_perf (
+    as_of_date date NOT NULL,
+    sector text NOT NULL,
+    y_excess_20d double precision, -- (Sẽ được tính ở Task 2)
+    PRIMARY KEY (as_of_date, sector)
+);
+CREATE INDEX IF NOT EXISTS idx_sector_perf_date ON sector_perf(as_of_date);
+CREATE INDEX IF NOT EXISTS idx_sector_perf_sector ON sector_perf(sector);
+
+-- (Point 1) Bảng tác động vĩ mô (real-time)
+CREATE TABLE IF NOT EXISTS macro_impact_rt (
+    as_of_date date NOT NULL,
+    sector text NOT NULL,
+    horizon_days int NOT NULL DEFAULT 20,
+    impact double precision,
+    confidence double precision,
+    model_version text,
+    created_at timestamptz default now(),
+    PRIMARY KEY (as_of_date, sector, horizon_days)
+);
+ALTER TABLE macro_impact_rt ADD CONSTRAINT chk_conf_range CHECK (confidence BETWEEN 0 AND 1);
+CREATE INDEX IF NOT EXISTS idx_macro_impact_rt_date ON macro_impact_rt(as_of_date);
+CREATE INDEX IF NOT EXISTS idx_macro_impact_rt_sector ON macro_impact_rt(sector);
+
+-- (Point 1) Bảng ghi đè UI
+CREATE TABLE IF NOT EXISTS macro_ui_override (
+    sector text PRIMARY KEY,
+    weight double precision,
+    ttl_until date,
+    updated_at timestamptz default now()
+);
+ALTER TABLE macro_ui_override ADD CONSTRAINT chk_weight_range CHECK (weight BETWEEN -1.0 AND 1.0);
+ALTER TABLE macro_ui_override ADD CONSTRAINT chk_ttl_future CHECK (ttl_until IS NULL OR ttl_until >= CURRENT_DATE);
+
+
+-- (Point 7) Retention Policy: Lên lịch (schedule) một cron job (ví dụ: hàng tháng) để chạy DELETE FROM macro_impact_rt WHERE as_of_date < (CURRENT_DATE - INTERVAL '1095 days');

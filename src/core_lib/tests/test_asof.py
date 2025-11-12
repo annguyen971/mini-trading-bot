@@ -13,3 +13,5 @@ def test_time_cheat_logic():
 
     # Assert: Verify that the future data was excluded
     assert True  # Placeholder assertion
+
+# TODO: (Point 10) Cập nhật src/core_lib/tests/test_asof.py (hoặc tạo file test mới) để bao gồm các kịch bản trong 'Test cần có' của bản vá V1.2.
