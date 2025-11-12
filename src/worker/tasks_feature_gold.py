@@ -355,6 +355,55 @@ def pg_conn():
         conn.autocommit = False
         yield conn
 
+def atomic_publish(conn, df: pl.DataFrame, version: str):
+    """
+    Atomically publishes a new version of the feature data.
+    - Creates a temporary table.
+    - Writes the DataFrame to it.
+    - Validates the data.
+    - Swaps the temp table with the main serving table within a transaction.
+    """
+    temp_table_name = f"features_gold_serving_{version}"
+    serving_table_name = "features_gold_serving"
+    backup_table_name = f"features_gold_serving_bak_{version}"
+
+    logger.info(f"Starting atomic publish for version {version}...")
+    try:
+        # Write to a temporary table
+        df.write_database(
+            table_name=temp_table_name,
+            connection_uri=DB_URL,
+            if_exists="replace",
+            engine="adbc"
+        )
+        logger.info(f"Successfully wrote data to temp table {temp_table_name}.")
+
+        with conn.cursor() as cur:
+            # --- Validation ---
+            cur.execute(f"SELECT COUNT(*) FROM {temp_table_name}")
+            row_count = cur.fetchone()[0]
+            if row_count != len(df):
+                raise ValueError(f"Validation failed: Row count mismatch. Expected {len(df)}, got {row_count}")
+            logger.info("Validation passed.")
+
+            # --- Atomic Swap ---
+            cur.execute("BEGIN;")
+            cur.execute(f"ALTER TABLE IF EXISTS {serving_table_name} RENAME TO {backup_table_name};")
+            cur.execute(f"ALTER TABLE {temp_table_name} RENAME TO {serving_table_name};")
+            cur.execute("COMMIT;")
+            logger.info(f"Atomic swap complete. '{serving_table_name}' is now live.")
+
+            # --- Cleanup ---
+            cur.execute(f"DROP TABLE IF EXISTS {backup_table_name};")
+            logger.info(f"Cleaned up backup table {backup_table_name}.")
+            conn.commit()
+
+    except Exception as e:
+        logger.error(f"Atomic publish for version {version} failed: {e}")
+        conn.rollback()
+        raise
+
+
 def run_feature_gold_batch():
     lock_name = 'feature_gold_batch'
     with pg_conn() as conn:
@@ -377,15 +426,15 @@ def run_feature_gold_batch():
 
             # The view v_features_asof does not exist, so this will fail.
             # Using a placeholder query for now.
-            df = read_sql_pl("SELECT 'AAPL' as symbol, CURRENT_DATE as effective_date", params=None) # (Point 6)
+            df = read_sql_pl("SELECT * FROM v_features_asof", params=None)
 
             df = apply_hmm(df)
             df = calculate_scores(df, conn, ENABLE_MACRO_BLEND)
 
             logger.info("Feature gold batch job finished calculations and is ready to publish.")
             # Publishing is commented out as the pipeline is not fully functional
-            # version = f"v{pd.Timestamp.now().strftime('%Y%m%d%H%M%S')}"
-            # atomic_publish(conn, df, version)
+            version = f"v{pd.Timestamp.now().strftime('%Y%m%d%H%M%S')}"
+            atomic_publish(conn, df, version)
 
             conn.commit()
 
