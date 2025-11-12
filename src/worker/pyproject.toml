@@ -11,4 +11,7 @@ dependencies = [
     "scipy",
     "hmmlearn",
     "core-lib @ file://../core_lib",
+    "psycopg[binary]",
+    "pandas",
+    "SQLAlchemy"
 ]

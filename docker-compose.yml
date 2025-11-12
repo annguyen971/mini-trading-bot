@@ -17,6 +17,8 @@ services:
   # 2. DATABASE
   db:
     image: postgres:15
+    ports:
+      - "5432:5432"
     restart: always
     environment:
       POSTGRES_USER: hunter

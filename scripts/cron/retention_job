@@ -1,0 +1,19 @@
+#!/bin/sh
+#
+# This cron job is responsible for cleaning up old records from the
+# macro_impact_rt table to prevent it from growing indefinitely.
+#
+# It runs once a month and deletes records older than 90 days.
+# The DB_URL environment variable must be available in the cron execution environment.
+
+RETENTION_DAYS=90
+
+echo "Running retention job for macro_impact_rt..."
+
+# Construct the psql command
+# The --quiet option suppresses informational messages.
+# The -c option executes a single command string.
+psql "$DB_URL" --quiet -c \
+  "DELETE FROM macro_impact_rt WHERE as_of_date < NOW() - INTERVAL '${RETENTION_DAYS} days';"
+
+echo "Retention job complete."
