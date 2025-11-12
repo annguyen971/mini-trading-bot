@@ -46,6 +46,8 @@ services:
     env_file: .env
     environment:
       - DB_URL=${DB_URL}
+      - ADMIN_KEY=${ADMIN_KEY}
+      - MACRO_TZ=${MACRO_TZ} # (MỚI)
     depends_on:
       db: { condition: service_healthy }
     volumes:
@@ -69,6 +71,8 @@ services:
     env_file: .env
     environment:
       - DB_URL=${DB_URL}
+      - ENABLE_MACRO_BLEND=${ENABLE_MACRO_BLEND} # (MỚI)
+      - MACRO_TZ=${MACRO_TZ} # (MỚI)
     depends_on:
       db: { condition: service_healthy }
     volumes:

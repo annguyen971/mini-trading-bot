@@ -2,12 +2,15 @@ import os
 import hashlib
 from datetime import datetime, timedelta, timezone
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, condecimal
+from datetime import date
 import psycopg
 from core_lib.db import get_db_connection
 import pickle
 
 app = FastAPI()
+
+MACRO_TZ = os.getenv("MACRO_TZ", "Asia/Ho_Chi_Minh")
 
 app.state.model_cache = None
 app.state.model_metadata = {}
@@ -285,10 +288,10 @@ async def get_health_stats():
     finally:
         if conn: conn.close()
 
-class MacroImpactConfig(BaseModel):
-    factor: str
+class MacroOverrideConfig(BaseModel):
     sector: str
-    impact: str
+    weight: condecimal(ge=-1.0, le=1.0)
+    ttl_until: date | None = None
 
 @app.get("/admin/macro/impact", dependencies=[Depends(verify_admin_key)])
 async def get_macro_impact_config():
@@ -296,7 +299,23 @@ async def get_macro_impact_config():
     try:
         conn = get_db_connection()
         with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            cur.execute("SELECT factor, sector, impact FROM dim_macro_sector_impact")
+            # (SỬA TRUY VẤN - Point 1, 5)
+            cur.execute(f"""
+                WITH today AS (
+                    SELECT (CURRENT_TIMESTAMP AT TIME ZONE %(tz)s)::date AS d
+                )
+                SELECT
+                    s.sector,
+                    s.display_name,
+                    rt.impact AS impact_suggested,
+                    rt.confidence,
+                    ui.weight AS weight_override,
+                    ui.ttl_until
+                FROM dim_sector s -- (Point 1)
+                CROSS JOIN today t
+                LEFT JOIN macro_impact_rt rt ON rt.sector = s.sector AND rt.as_of_date = t.d
+                LEFT JOIN macro_ui_override ui ON ui.sector = s.sector;
+            """, {"tz": MACRO_TZ})
             return cur.fetchall()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -304,7 +323,7 @@ async def get_macro_impact_config():
         if conn: conn.close()
 
 @app.post("/admin/macro/impact", dependencies=[Depends(verify_admin_key)])
-async def update_macro_impact_config(data: list[MacroImpactConfig]):
+async def update_macro_impact_config(data: list[MacroOverrideConfig]):
     conn = None
     try:
         conn = get_db_connection()
@@ -314,11 +333,14 @@ async def update_macro_impact_config(data: list[MacroImpactConfig]):
             execute_values(
                 cur,
                 """
-                INSERT INTO dim_macro_sector_impact (factor, sector, impact)
+                INSERT INTO macro_ui_override (sector, weight, ttl_until)
                 VALUES %s
-                ON CONFLICT (factor, sector) DO UPDATE SET impact = EXCLUDED.impact
+                ON CONFLICT (sector) DO UPDATE SET
+                    weight = EXCLUDED.weight,
+                    ttl_until = EXCLUDED.ttl_until,
+                    updated_at = NOW()
                 """,
-                [ (item.factor, item.sector, item.impact) for item in data]
+                [ (item.sector, item.weight, item.ttl_until) for item in data]
             )
             conn.commit()
         return {"status": "updated"}
