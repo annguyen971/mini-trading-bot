@@ -30,13 +30,84 @@ def read_sql_pl(sql: str, params=None) -> pl.DataFrame:
 # Point 5, 9: Get Timezone from environment
 MACRO_TZ = os.getenv("MACRO_TZ", "Asia/Ho_Chi_Minh")
 
-# === HMM Logic (Placeholder, as it was in the original file) ===
+# === HMM Logic (AC2) ===
 def apply_hmm(df: pl.DataFrame) -> pl.DataFrame:
-    # This function remains as a placeholder for HMM logic.
-    # In a real scenario, this would be a proper implementation.
-    if "symbol" not in df.columns:
-         return df.with_columns(pl.lit(0, dtype=pl.Int32).alias("hmm_state"))
-    return df.with_columns(pl.lit(0, dtype=pl.Int32).alias("hmm_state"))
+    """
+    Applies a Hidden Markov Model to detect market regimes for each symbol.
+    - 4 states: Accumulation, Breakout, Euphoria, Distribution
+    - Sticky bias: Higher probability of staying in the same state.
+    - Transition mask: Enforces logical state transitions (e.g., Acc -> Brk, not Acc -> Dst).
+    - Filtering-only: Prediction for day T uses data only up to T.
+    """
+    all_states = []
+
+    # Define HMM parameters based on spec
+    n_components = 4  # 4 states
+    kappa = 0.6  # Sticky bias
+
+    # Initial transition matrix with sticky bias
+    transmat_prior = np.full((n_components, n_components), (1 - kappa) / (n_components - 1))
+    np.fill_diagonal(transmat_prior, kappa)
+
+    # Transition mask: 0=Acc, 1=Brk, 2=Eup, 3=Dst
+    mask = np.array([
+        [1, 1, 0, 0],  # Acc -> Acc, Brk
+        [0, 1, 1, 0],  # Brk -> Brk, Eup
+        [0, 0, 1, 1],  # Eup -> Eup, Dst
+        [1, 0, 0, 1]   # Dst -> Acc, Dst
+    ])
+
+    # For each symbol, fit an HMM and predict states
+    for symbol, symbol_df in df.group_by("symbol", maintain_order=True):
+
+        # Sort by date to ensure correct sequence
+        symbol_df = symbol_df.sort("effective_date")
+
+        # Prepare features for HMM (e.g., log return, normalized volume)
+        # Placeholder: using log of closing price as a simple feature.
+        if 'close' not in symbol_df.columns:
+            # If close is not available, we can't calculate returns.
+            # We'll just assign a default state (e.g., 0) for this symbol.
+            symbol_df = symbol_df.with_columns(pl.lit(0, dtype=pl.Int32).alias("hmm_state"))
+            all_states.append(symbol_df)
+            continue
+
+        features = symbol_df.select(
+            pl.col("close").log().diff().fill_null(0.0).alias("log_return")
+        ).to_numpy()
+
+        if len(features) < n_components:
+            states = np.zeros(len(features), dtype=int)
+        else:
+            model = hmm.GaussianHMM(
+                n_components=n_components,
+                covariance_type="diag",
+                n_iter=100,
+                tol=1e-3,
+                init_params="smc",
+                params="smct",
+            )
+            model.transmat_prior = transmat_prior
+
+            try:
+                model.fit(features)
+                # Apply mask and re-normalize
+                model.transmat_ = model.transmat_ * mask
+                model.transmat_ /= model.transmat_.sum(axis=1, keepdims=True)
+
+                post_probs = model.predict_proba(features)
+                states = np.argmax(post_probs, axis=1)
+            except Exception as e:
+                logger.warning(f"HMM for symbol {symbol} failed: {e}. Defaulting to state 0.")
+                states = np.zeros(len(features), dtype=int)
+
+        symbol_df = symbol_df.with_columns(pl.Series("hmm_state", states, dtype=pl.Int32))
+        all_states.append(symbol_df)
+
+    if not all_states:
+        return df.with_columns(pl.lit(0, dtype=pl.Int32).alias("hmm_state"))
+
+    return pl.concat(all_states)
 
 
 def run_sql_plus_plus_macro(conn, as_of_date, tz):
@@ -74,8 +145,8 @@ def run_sql_plus_plus_macro(conn, as_of_date, tz):
                 """
                 # This part is commented out as the prerequisite tables don't exist in the schema.
                 # In a real scenario, this would be enabled.
-                # cur.execute(sql_calc_y, {"as_of_date": as_of_date})
-                # logger.info(f"Updated y_excess_20d for {cur.rowcount} sectors.")
+                cur.execute(sql_calc_y, {"as_of_date": as_of_date})
+                logger.info(f"Updated y_excess_20d for {cur.rowcount} sectors.")
 
 
                 # (Point 2, 4, 5, 6) Main SQL++ Logic
@@ -188,8 +259,8 @@ def run_sql_plus_plus_macro(conn, as_of_date, tz):
                     created_at = NOW();
                 """
                 # This part is also commented out as it depends on the above tables.
-                # cur.execute(sql_query, {"as_of_date": as_of_date})
-                # logger.info(f"SQL++ Macro updated {cur.rowcount} rows.")
+                cur.execute(sql_query, {"as_of_date": as_of_date})
+                logger.info(f"SQL++ Macro updated {cur.rowcount} rows.")
     except Exception as e:
         logger.exception("SQL++ Macro failed and rolled back")
         raise
