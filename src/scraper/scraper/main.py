@@ -1,6 +1,6 @@
 from datetime import datetime
-from ingestion import process_and_ingest_data
-from utils import RateLimiter, CircuitBreaker
+from scraper.ingestion import process_and_ingest_data
+from scraper.utils import RateLimiter, CircuitBreaker
 from core_lib.db import get_db_connection
 
 # --- Defensive Mechanisms Setup ---

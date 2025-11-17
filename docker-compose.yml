@@ -50,11 +50,11 @@ services:
     environment:
       - DB_URL=${DB_URL}
       - ADMIN_KEY=${ADMIN_KEY}
-      - MACRO_TZ=${MACRO_TZ} # (MỚI)
+      - MACRO_TZ=${MACRO_TZ}
     depends_on:
       db: { condition: service_healthy }
     volumes:
-      - artifacts:/opt/artifacts:ro    # Đọc .pkl
+      - artifacts:/opt/artifacts:ro     # Đọc .pkl
       - packs:/opt/packs               # Viết/Đọc .zip cache
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/readyz || exit 1"]
@@ -76,8 +76,8 @@ services:
     env_file: .env
     environment:
       - DB_URL=${DB_URL}
-      - ENABLE_MACRO_BLEND=${ENABLE_MACRO_BLEND} # (MỚI)
-      - MACRO_TZ=${MACRO_TZ} # (MỚI)
+      - ENABLE_MACRO_BLEND=${ENABLE_MACRO_BLEND}
+      - MACRO_TZ=${MACRO_TZ}
     depends_on:
       db: { condition: service_healthy }
     volumes:
@@ -95,7 +95,7 @@ services:
       context: ./src
       dockerfile: worker/Dockerfile
     command: ["python", "-m", "worker.tasks_train", "--profile", "backtest"]
-    profiles: ["backtest"]               # <<< YÊU CẦU PRD
+    profiles: ["backtest"]
     env_file: .env
     environment:
       - DB_URL=${DB_URL}
@@ -132,10 +132,14 @@ services:
       context: ./src
       dockerfile: dash/Dockerfile
     command: >
-      sh -c "streamlit run app.py --server.port=8501 --server.address=0.0.0.0 --server.headless=true"
+      sh -c "streamlit run dash/app.py --server.port=8501 --server.address=0.0.0.0 --server.headless=true"
     env_file: .env
     environment:
       - DB_URL=${DB_URL}
+      # ---> ĐÃ SỬA: Thêm biến này để Dash gọi được API nội bộ <---
+      - API_BASE_URL=http://api:8000
+      # Giữ lại cái cũ cho chắc chắn (phòng khi code dùng tên biến khác)
+      - API_URL=http://api:8000
     depends_on:
       db: { condition: service_healthy }
       api: { condition: service_healthy }
@@ -147,14 +151,13 @@ services:
 
   # 8. CRON (SIDECAR)
   cron:
-    build: ./src/cron # <-- THÊM DÒNG NÀY
+    build: ./src/cron
     profiles: ["cron"]
     volumes:
       - ./scripts/cron:/etc/periodic/custom:ro
       - /var/run/docker.sock:/var/run/docker.sock # Để chạy docker exec
     environment:
       CRON_TZ: UTC
-    #command: ["-f", "-l", "8"]
     deploy: { resources: { limits: { cpus: '0.1', memory: 64M } } }
 
 volumes:

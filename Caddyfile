@@ -8,7 +8,7 @@ stockhunter.duckdns.org {
     }
 
     # Web app (Streamlit)
-    handle / {
+    handle /* {
         reverse_proxy dash:8501
     }
 

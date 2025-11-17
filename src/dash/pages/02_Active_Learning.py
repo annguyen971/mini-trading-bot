@@ -135,7 +135,16 @@ with st.container(border=True):
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=evidence_df['date'], y=evidence_df['close'], mode='lines', name='Close Price'))
             # Convert effective_date to a pandas Timestamp to ensure Plotly compatibility
-            fig.add_vline(x=pd.Timestamp(effective_date), line_width=2, line_dash="dash", line_color="red", annotation_text="Effective Date")
+            #fig.add_vline(x=pd.Timestamp(effective_date), line_width=2, line_dash="dash", line_color="red", annotation_text="Effective Date")
+            # --- FIX PANDAS 2.0 vs PLOTLY ---
+            # Chuyển đổi timestamp sang milliseconds (int64)
+            try:
+                vline_x = pd.Timestamp(effective_date).value // 10**6
+            except:
+                vline_x = effective_date # Fallback nếu lỗi
+
+            fig.add_vline(x=vline_x, line_width=2, line_dash="dash", line_color="red", annotation_text="Effective Date")
+            # --------------------------------
             fig.update_layout(
                 title=f"Price History for {sample['symbol']} (Data shown only up to {sample['effective_date']})",
                 xaxis_title="Date",

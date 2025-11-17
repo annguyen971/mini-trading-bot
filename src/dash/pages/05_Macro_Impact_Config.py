@@ -12,7 +12,7 @@ HEADERS = {"X-ADMIN-KEY": ADMIN_KEY}
 # (Point 8) Add timeout to httpx client
 API_CLIENT = httpx.Client(timeout=10.0)
 
-st.set_page_config(title="Macro Impact Config", layout="wide")
+st.set_page_config(page_title="Macro Impact Config", layout="wide")
 
 # (Point 8) Check auth
 if not check_auth() or not ADMIN_KEY:

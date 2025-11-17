@@ -8,7 +8,8 @@ from core_lib.queue import enqueue_task
 
 def _calculate_content_hash(data: Dict[str, Any]) -> str:
     """Calculates a SHA256 hash of the JSON-serialized data."""
-    serialized_data = json.dumps(data, sort_keys=True).encode('utf-8')
+    # FIX 1: Thêm default=str để xử lý datetime (Đã làm ở bước trước)
+    serialized_data = json.dumps(data, sort_keys=True, default=str).encode('utf-8')
     return hashlib.sha256(serialized_data).hexdigest()
 
 def _normalize_to_utc(dt: datetime) -> datetime:
@@ -27,7 +28,11 @@ def process_and_ingest_data(raw_data: Dict[str, Any], source_name: str, task_kin
 
         first_seen_time = datetime.now(timezone.utc)
         publisher_time_raw = raw_data.get('publisher_time', first_seen_time)
-        publisher_time = _normalize_to_utc(publisher_time_raw)
+        
+        if isinstance(publisher_time_raw, str):
+             publisher_time = first_seen_time
+        else:
+             publisher_time = _normalize_to_utc(publisher_time_raw)
 
         as_of_time = max(publisher_time, first_seen_time)
 
@@ -40,8 +45,12 @@ def process_and_ingest_data(raw_data: Dict[str, Any], source_name: str, task_kin
                 ON CONFLICT (content_hash) DO NOTHING
                 RETURNING id;
             """
+            
+            # FIX 1: Thêm default=str vào json.dumps
             params = (
-                source_name, json.dumps(raw_data), content_hash,
+                source_name, 
+                json.dumps(raw_data, default=str), 
+                content_hash,
                 publisher_time, first_seen_time, as_of_time
             )
             cursor.execute(insert_query, params)
@@ -50,7 +59,10 @@ def process_and_ingest_data(raw_data: Dict[str, Any], source_name: str, task_kin
             if result:
                 inserted_id = result[0]
                 print(f"Successfully inserted record into raw_bronze with id: {inserted_id}")
-                task_payload = {"bronze_id": inserted_id, "source": source_name}
+                
+                # ---> FIX 2: CHUYỂN UUID THÀNH STRING TẠI ĐÂY <---
+                task_payload = {"bronze_id": str(inserted_id), "source": source_name}
+                
                 enqueue_task(conn, task_kind, task_payload)
             else:
                 print(f"Record with hash {content_hash} already exists. Skipping enqueue.")

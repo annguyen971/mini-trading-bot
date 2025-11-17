@@ -12,7 +12,7 @@ COPY . .
 RUN pip install ./core_lib
 
 # 2. Cài đặt các thư viện public của 'dash' (từ pyproject.toml)
-RUN pip install streamlit httpx pandas seaborn
+RUN pip install streamlit httpx pandas seaborn plotly requests
 
 # 3. Cài đặt 'dash' mà KHÔNG KIỂM TRA dependency
 RUN pip install --no-deps ./dash
