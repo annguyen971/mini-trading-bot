@@ -1,9 +1,8 @@
-version: "3.9"
-
 services:
   # 1. PROXY (CỔNG BẢO MẬT)
   proxy:
     image: caddy:2-alpine
+    env_file: .env
     restart: always
     ports: ["80:80","443:443"]
     volumes:
@@ -42,9 +41,11 @@ services:
 
   # 3. API (BIND NỘI BỘ)
   api:
-    build: { context: ./src/api }
+    build:
+      context: ./src
+      dockerfile: api/Dockerfile
     command: >
-      sh -c "gunicorn api.main:app -k uvicorn.workers.UvicornWorker -w 2 --bind 127.0.0.1:8000"
+      sh -c "gunicorn api.main:app -k uvicorn.workers.UvicornWorker -w 2 --bind 0.0.0.0:8000"
     env_file: .env
     environment:
       - DB_URL=${DB_URL}
@@ -68,7 +69,9 @@ services:
 
   # 4. WORKER (BATCH CHÍNH)
   worker:
-    build: { context: ./src/worker }
+    build:
+      context: ./src
+      dockerfile: worker/Dockerfile
     command: ["python", "-m", "worker.main"] # Chạy chờ hoặc chạy tác vụ dài
     env_file: .env
     environment:
@@ -88,7 +91,9 @@ services:
 
   # 5. BACKTEST (CHỈ CHẠY KHI CẦN)
   worker_bt:
-    build: { context: ./src/worker }
+    build:
+      context: ./src
+      dockerfile: worker/Dockerfile
     command: ["python", "-m", "worker.tasks_train", "--profile", "backtest"]
     profiles: ["backtest"]               # <<< YÊU CẦU PRD
     env_file: .env
@@ -106,7 +111,9 @@ services:
 
   # 6. SCRAPER (LUÔN CHẠY)
   scraper:
-    build: { context: ./src/scraper }
+    build:
+      context: ./src
+      dockerfile: scraper/Dockerfile
     command: ["python", "-m", "scraper.main"]
     env_file: .env
     environment:
@@ -121,9 +128,11 @@ services:
 
   # 7. DASHBOARD (BIND NỘI BỘ)
   dash:
-    build: { context: ./src/dash }
+    build:
+      context: ./src
+      dockerfile: dash/Dockerfile
     command: >
-      sh -c "streamlit run app.py --server.port=8501 --server.address=127.0.0.1 --server.headless=true"
+      sh -c "streamlit run app.py --server.port=8501 --server.address=0.0.0.0 --server.headless=true"
     env_file: .env
     environment:
       - DB_URL=${DB_URL}
@@ -138,14 +147,14 @@ services:
 
   # 8. CRON (SIDECAR)
   cron:
-    image: crazymax/crond:latest
+    build: ./src/cron # <-- THÊM DÒNG NÀY
     profiles: ["cron"]
     volumes:
       - ./scripts/cron:/etc/periodic/custom:ro
       - /var/run/docker.sock:/var/run/docker.sock # Để chạy docker exec
     environment:
       CRON_TZ: UTC
-    command: ["-f", "-l", "8"]
+    #command: ["-f", "-l", "8"]
     deploy: { resources: { limits: { cpus: '0.1', memory: 64M } } }
 
 volumes:

@@ -7,8 +7,16 @@ WORKDIR /app
 # Copy the project files into the container
 COPY . .
 
-# Install any needed packages specified in pyproject.toml
-RUN pip install .
+# ---> SỬA LỖI <---
+# 1. Cài đặt core_lib
+RUN pip install ./core_lib
+
+# 2. Cài đặt các thư viện public của 'dash' (từ pyproject.toml)
+RUN pip install streamlit httpx pandas seaborn
+
+# 3. Cài đặt 'dash' mà KHÔNG KIỂM TRA dependency
+RUN pip install --no-deps ./dash
+# ---> HẾT SỬA LỖI <---
 
 # Expose the port that Streamlit runs on
 EXPOSE 8501

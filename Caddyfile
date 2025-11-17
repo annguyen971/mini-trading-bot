@@ -1,0 +1,19 @@
+stockhunter.duckdns.org {
+    # Tự động lấy chứng chỉ SSL
+    tls annguyen.0303122@gmail.com
+
+    # Bảo vệ bằng mật khẩu (lấy từ file .env)
+    basic_auth {
+        admin {$BASIC_AUTH_HASH}
+    }
+
+    # Web app (Streamlit)
+    handle / {
+        reverse_proxy dash:8501
+    }
+
+    # API (FastAPI)
+    handle /api/* {
+        reverse_proxy api:8000
+    }
+}
