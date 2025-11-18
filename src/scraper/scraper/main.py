@@ -44,9 +44,9 @@ def main():
     source_name = "vnstock"
     source = VnStockSource()
 
-    # --- Backpressure Implementation ---
+    # --- FIX: Functional Backpressure Implementation ---
     if check_backpressure():
-        print("Backpressure enabled: Halving scrape rate to 30 reqs/minute.")
+        print("Backpressure ENABLED. Reducing rate to 30 req/min.")
         rate_limiter.set_requests_per_minute(30)
 
     # --- Fetch, Adapt, and Ingest Data ---
@@ -72,7 +72,7 @@ def main():
                     process_and_ingest_data(
                         raw_data=adapted_data.model_dump(),
                         source_name=source_name,
-                        task_kind="TA_PROCESS" # Updated Task Kind for V3.1
+                        task_kind="TA_PROCESS"
                     )
                 print(f"Successfully processed {len(raw_price_data)} price records for {symbol}.")
 
@@ -96,7 +96,7 @@ def main():
                     process_and_ingest_data(
                         raw_data=adapted_data.model_dump(),
                         source_name=source_name,
-                        task_kind="NLP_PROCESS" # Updated Task Kind for V3.1
+                        task_kind="NLP_PROCESS"
                     )
                 print(f"Successfully processed {len(raw_news_data)} news articles for {symbol}.")
 

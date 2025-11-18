@@ -6,7 +6,7 @@ import logging
 # Updated to use 'vnstock' library
 from vnstock import Vnstock
 
-# Corrected the import path for the core library
+# FIX: Corrected the import path to remove the extra 'core_lib'
 from core_lib.data_source import PriceSource, NewsSource
 
 # Set up logging
@@ -61,7 +61,6 @@ class VnStockSource(PriceSource, NewsSource):
         """
         try:
             logger.info(f"Fetching latest news for {symbol} for the last {days} days")
-            # The vnstock news call seems to return a list of dicts directly
             news_list = self.stock.stock.news(symbol=symbol, page_size=30, page_num=1)
 
             if not news_list:
@@ -80,13 +79,12 @@ class VnStockSource(PriceSource, NewsSource):
                 if published_at < cutoff_date:
                     continue
 
-                # Safe Data Mapping using .get()
                 processed_article = {
                     'id': article.get('id', article.get('url', '')),
                     'url': article.get('url', ''),
                     'title': article.get('title', ''),
                     'source': article.get('source', 'vnstock'),
-                    'text': article.get('description', ''), # map description to text
+                    'text': article.get('description', ''),
                     'published_at': published_at,
                     'first_seen_time': datetime.now()
                 }
