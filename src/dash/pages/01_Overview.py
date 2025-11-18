@@ -1,62 +1,58 @@
 import streamlit as st
 import httpx
-import os
 import json
-
-# --- Configuration ---
-# Use localhost for local development if API_BASE_URL is not set
-API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
-ADMIN_KEY = os.getenv("ADMIN_KEY", "supersecretkey")
-HEADERS = {"X-ADMIN-KEY": ADMIN_KEY}
+from utils import get_api_client, show_safety_banner
 
 # --- API Functions ---
+
 @st.cache_data(ttl=60)
 def get_prediction(symbol: str):
     """Fetches prediction data for a given stock symbol."""
     if not symbol:
         return None
     try:
-        url = f"{API_BASE_URL}/predict"
-        params = {"symbol": symbol}
-        response = httpx.get(url, headers=HEADERS, params=params, timeout=10)
-        response.raise_for_status()
-        return response.json()
+        with get_api_client() as client:
+            response = client.get("/predict", params={"symbol": symbol})
+            response.raise_for_status()
+            return response.json()
     except httpx.HTTPStatusError as e:
-        st.error(f"HTTP error fetching prediction: {e.response.status_code} - {e.response.text}")
+        # Specifically handle 503 Service Unavailable (likely Kill-Switch)
+        if e.response.status_code == 503:
+            st.error("🚨 **Service Unavailable**: The prediction service is currently offline. This might be due to a Kill-Switch or maintenance. Please try again later.")
+        else:
+            st.error(f"HTTP error fetching prediction: {e.response.status_code} - {e.response.text}")
     except httpx.RequestError as e:
         st.error(f"Connection error fetching prediction: {e}")
     return None
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300) # Cache longer as this data is less likely to change frequently
 def get_export_context(symbol: str, format: str = "md"):
     """Fetches the AI hand-off context."""
     if not symbol:
         return None
     try:
-        url = f"{API_BASE_URL}/export/context"
-        params = {"symbol": symbol, "format": format}
-        response = httpx.get(url, headers=HEADERS, params=params, timeout=10)
-        response.raise_for_status()
-        if format == "json":
-            return json.dumps(response.json(), indent=2)
-        return response.text
+        with get_api_client() as client:
+            response = client.get("/export/context", params={"symbol": symbol, "format": format})
+            response.raise_for_status()
+            if format == "json":
+                return json.dumps(response.json(), indent=2)
+            return response.text
     except httpx.HTTPStatusError as e:
         st.error(f"HTTP error fetching context: {e.response.status_code} - {e.response.text}")
     except httpx.RequestError as e:
         st.error(f"Connection error fetching context: {e}")
     return None
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
 def get_export_pack(symbol: str):
     """Fetches the full data pack."""
     if not symbol:
         return None
     try:
-        url = f"{API_BASE_URL}/export/pack"
-        params = {"symbol": symbol}
-        response = httpx.get(url, headers=HEADERS, params=params, timeout=30)
-        response.raise_for_status()
-        return response.content
+        with get_api_client() as client:
+            response = client.get("/export/pack", params={"symbol": symbol})
+            response.raise_for_status()
+            return response.content
     except httpx.HTTPStatusError as e:
         st.error(f"HTTP error fetching data pack: {e.response.status_code} - {e.response.text}")
     except httpx.RequestError as e:
@@ -75,17 +71,7 @@ if symbol:
 
     if data:
         # --- Safety Banner ---
-        safety_banner = data.get("safety_banner", {})
-        level = safety_banner.get("level", "info")
-        title = safety_banner.get("title", "Status")
-        message = safety_banner.get("message", "System is operating normally.")
-
-        if level == "error":
-            st.error(f"**{title}**: {message}")
-        elif level == "warning":
-            st.warning(f"**{title}**: {message}")
-        else:
-            st.info(f"**{title}**: {message}")
+        show_safety_banner(data.get("safety_banner", {}))
 
         # --- Main Metrics ---
         st.header(f"Analysis for {symbol}")
@@ -103,7 +89,12 @@ if symbol:
 
         md_context = get_export_context(symbol, format="md")
         if md_context:
-            st.sidebar.text_area("Markdown for Gemini/ChatGPT", md_context, height=200)
+            st.sidebar.download_button(
+                label="📋 Copy Markdown Prompt",
+                data=md_context,
+                file_name=f"prompt_{symbol}.md",
+                mime="text/markdown",
+            )
 
         pack_data = get_export_pack(symbol)
         if pack_data:
@@ -111,7 +102,7 @@ if symbol:
                 label="📥 Download Full Data Pack (.zip)",
                 data=pack_data,
                 file_name=f"ai_pack_{symbol}.zip",
-                mime="application/zip"
+                mime="application/zip",
             )
     else:
         st.warning("Could not retrieve data. Is the API running and the symbol correct?")
