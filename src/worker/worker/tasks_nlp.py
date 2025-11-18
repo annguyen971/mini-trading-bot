@@ -1,40 +1,122 @@
-import random
+import os
 import time
-from typing import Dict, List, Optional
+import json
+from typing import Dict, List, Optional, Tuple
+
+import google.generativeai as genai
+from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockThreshold
+from google.api_core import exceptions as google_exceptions
 
 from core_lib.db import get_db_connection
 from core_lib.locks import get_advisory_lock
 
 # --- Constants ---
 ADVISORY_LOCK_NAME = "nlp_batch"
-MAX_SEQ_LEN = 256
-TIER1_CONFIDENCE_THRESHOLD = 0.7
+NLP_BATCH_SIZE = 20  # Max items to process in one API call
+MAX_RETRIES = 3
+INITIAL_BACKOFF = 2  # seconds
 CATALYST_KEYWORDS = {
     "M&A": ["M&A", "sáp nhập", "thâu tóm"],
     "EARNINGS_SURPRISE": ["KQKD vượt kỳ vọng", "lợi nhuận đột biến"],
     "CAPITAL_INCREASE": ["tăng vốn", "phát hành thêm"],
 }
 
-# --- Placeholder Models ---
 
-class Tier1_Model:
-    """Placeholder for a scikit-learn TF-IDF + Logistic Regression model."""
-    def predict_proba(self, texts: List[str]) -> List[Dict[str, float]]:
-        # Simulate predictions
-        return [{"sentiment": random.uniform(-1, 1)} for _ in texts]
+# --- Gemini Configuration ---
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY environment variable not set.")
 
-class Tier2_Model:
-    """Placeholder for an onnxruntime PhoBERT INT8 model."""
-    def predict(self, texts: List[str]) -> List[Dict[str, float]]:
-        # Simulate predictions, including potential failures
-        results = []
-        for text in texts:
-            if "fail" in text.lower(): # Simulate an OOM error
-                raise MemoryError("Simulated OOM Error")
-            results.append({"sentiment": random.uniform(-1, 1) * 1.2}) # Simulate slightly better model
-        return results
+genai.configure(api_key=GOOGLE_API_KEY)
+
+# Define the structured output schema for Gemini
+RESPONSE_SCHEMA = {
+    "sentiment_score": float, # From -1.0 (very negative) to 1.0 (very positive)
+    "catalysts": List[str],   # List of relevant keywords like "M&A", "EARNINGS_SURPRISE"
+    "summary": str,           # A very brief, one-sentence summary
+}
+
+GENERATION_CONFIG = GenerationConfig(
+    response_mime_type="application/json",
+    temperature=0.2,
+)
+
+SAFETY_SETTINGS = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+}
+
+PROMPT_TEMPLATE = f"""
+Analyze the sentiment of the following Vietnamese stock market news snippets.
+For each snippet, provide:
+1.  `sentiment_score`: A float between -1.0 (very negative) and 1.0 (very positive).
+2.  `catalysts`: A list of any relevant catalysts from this list: {list(CATALYST_KEYWORDS.keys())}. If none, return an empty list.
+3.  `summary`: A concise, one-sentence summary in Vietnamese.
+
+Return a JSON object containing a key "results", which is a list of JSON objects matching this exact schema: {json.dumps(RESPONSE_SCHEMA)}.
+Do not include any other text or explanations in your response.
+
+Here are the news snippets:
+---
+{{news_snippets}}
+---
+"""
 
 # --- Core Logic ---
+
+def process_nlp_batch(docs: List[Tuple[str, str]]) -> List[Dict]:
+    """
+    Processes a batch of texts using the Gemini API with structured output,
+    batching, and retry logic.
+    """
+    if not docs:
+        return []
+
+    model = genai.GenerativeModel(
+        "gemini-1.5-flash",
+        generation_config=GENERATION_CONFIG,
+        safety_settings=SAFETY_SETTINGS
+    )
+
+    # Format the input for the prompt
+    formatted_snippets = "\n".join([f'{doc_id}: "{text}"' for doc_id, text in docs])
+    prompt = PROMPT_TEMPLATE.format(news_snippets=formatted_snippets)
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = model.generate_content(prompt)
+
+            # Clean and parse the JSON response
+            response_text = response.text.strip().replace("```json", "").replace("```", "")
+            results_data = json.loads(response_text)
+
+            # Add doc_id back to each result for traceability
+            processed_results = []
+            for i, (doc_id, _) in enumerate(docs):
+                 if i < len(results_data.get("results", [])):
+                    res = results_data["results"][i]
+                    res['doc_id'] = doc_id
+                    processed_results.append(res)
+            return processed_results
+
+        except (google_exceptions.ResourceExhausted, google_exceptions.ServiceUnavailable) as e:
+            wait_time = INITIAL_BACKOFF ** attempt
+            print(f"WARN: Rate limit or server error encountered. Retrying in {wait_time}s... (Attempt {attempt + 1}/{MAX_RETRIES})")
+            time.sleep(wait_time)
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"ERROR: Failed to parse Gemini response or key error: {e}")
+            print(f"Raw response was:\n{response.text}")
+            return [] # Fail the batch if parsing fails
+        except Exception as e:
+            print(f"ERROR: An unexpected error occurred with Gemini API: {e}")
+            # For other unexpected errors, fail the batch immediately
+            return []
+
+    print(f"ERROR: Batch failed after {MAX_RETRIES} retries.")
+    return []
+
 
 def scan_for_catalysts(text: str) -> Dict[str, bool]:
     """(AC16) Scans text for predefined catalyst keywords."""
@@ -54,56 +136,36 @@ def run_nlp_pipeline():
         return  # Exit if another process has the lock
 
     try:
-        tier1_model = Tier1_Model()
-        tier2_model = Tier2_Model()
-
-        # 1. Fetch data from raw_bronze (placeholder)
-        raw_texts_to_process = [
-            ("id_1", "Tin tốt, KQKD vượt kỳ vọng, lợi nhuận đột biến!"),
-            ("id_2", "Cổ phiếu có vẻ hơi đắt ở thời điểm này."), # Uncertain
-            ("id_3", "Một tin tức rất xấu, công ty sắp phá sản."),
-            ("id_4", "Văn bản này chứa từ 'fail' để mô phỏng lỗi OOM."),
+        # 1. Fetch data from raw_bronze (placeholder - replace with actual DB query)
+        #    In a real scenario, this would fetch records from the `raw_bronze` table
+        #    where the NLP results are pending.
+        raw_docs = [
+            ("doc_1", "Tin tức tuyệt vời cho VNM, KQKD vượt kỳ vọng, lợi nhuận đột biến!"),
+            ("doc_2", "FPT công bố kế hoạch sáp nhập và mua lại (M&A) công ty công nghệ ABC."),
+            ("doc_3", "Giá cổ phiếu HPG có vẻ không ổn định trong tuần này."),
+            ("doc_4", "Thị trường chung đang có dấu hiệu tiêu cực, nhiều nhà đầu tư lo ngại."),
         ]
 
-        for doc_id, text in raw_texts_to_process:
-            print(f"\n--- Processing doc_id: {doc_id} ---")
+        # 2. Process documents in batches
+        for i in range(0, len(raw_docs), NLP_BATCH_SIZE):
+            batch_docs = raw_docs[i:i + NLP_BATCH_SIZE]
+            print(f"\n--- Processing batch {i//NLP_BATCH_SIZE + 1} ---")
 
-            # (Tier 0) Prefilter
-            text_clipped = text[:MAX_SEQ_LEN]
+            results = process_nlp_batch(batch_docs)
 
-            # (Tier 1) Run Tiny Gate
-            tier1_result = tier1_model.predict_proba([text_clipped])[0]
-            sentiment_t1 = tier1_result.get("sentiment", 0)
+            if not results:
+                print(f"Batch {i//NLP_BATCH_SIZE + 1} failed. Skipping to next batch.")
+                continue
 
-            final_sentiment = sentiment_t1
-            escalated_to_t2 = False
-
-            # (Logic) Decide whether to escalate
-            if abs(sentiment_t1) < TIER1_CONFIDENCE_THRESHOLD:
-                print(f"Tier 1 uncertain (score: {sentiment_t1:.2f}). Escalating to Tier 2.")
-                escalated_to_t2 = True
-                try:
-                    # (Tier 2) Run PhoBERT
-                    tier2_result = tier2_model.predict([text_clipped])[0]
-                    final_sentiment = tier2_result.get("sentiment", sentiment_t1)
-                except Exception as e:
-                    # (AC7) Fallback logic
-                    print(f"ALERT: Tier 2 failed with error: {e}. Falling back to Tier 1 result.")
-                    final_sentiment = sentiment_t1
-            else:
-                print(f"Tier 1 confident (score: {sentiment_t1:.2f}). Accepting result.")
-
-            # (AC16) Scan for catalysts
-            catalysts = scan_for_catalysts(text_clipped)
-
-            # 4. Save results to Silver tables (placeholder)
-            print(f"Final Sentiment: {final_sentiment:.2f}")
-            if catalysts:
-                print(f"Found Catalysts: {list(catalysts.keys())}")
-
-            # In a real implementation, you would use the 'conn' object to
-            # write the sentiment to 'sa_silver' and any found catalysts
-            # to the 'catalyst_flags' table within a transaction.
+            # 3. Save results to Silver tables (placeholder for DB operations)
+            for result in results:
+                print(f"Result for {result['doc_id']}:")
+                print(f"  Sentiment Score: {result.get('sentiment_score')}")
+                print(f"  Catalysts: {result.get('catalysts')}")
+                print(f"  Summary: {result.get('summary')}")
+                # Here, you would execute INSERT/UPDATE statements to save these
+                # results into the `sa_silver` and `catalyst_flags` tables,
+                # linking them via the `doc_id`.
 
         conn.commit()
 

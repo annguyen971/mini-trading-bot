@@ -3,10 +3,9 @@ name = "worker"
 version = "0.1.0"
 dependencies = [
     "polars",
-    "transformers",
+    "google-generativeai",
     "snorkel",
     "scikit-learn",
-    "onnxruntime",
     "vectorbt",
     "scipy",
     "hmmlearn",
