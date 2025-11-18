@@ -67,9 +67,27 @@ CREATE TABLE IF NOT EXISTS sa_silver (
   text_len INT NOT NULL,
   language TEXT,
   bronze_ref_id UUID REFERENCES raw_bronze(id),
+  sentiment_score REAL,         -- Từ Gemini API
   validated_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sa_silver_text_norm_hash ON sa_silver (text_norm_hash);
+
+-- Bảng dữ liệu rác (MỚI V3.1)
+CREATE TABLE IF NOT EXISTS raw_bronze_bad (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  source_name TEXT,
+  payload_json JSONB,
+  reason TEXT,                 -- 'INVALID_TIMESTAMP', 'TITLE_TOO_SHORT'
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Bảng trạng thái Scraper (MỚI V3.1)
+CREATE TABLE IF NOT EXISTS scraper_state (
+    source_id TEXT PRIMARY KEY,
+    last_cursor TEXT,           -- last_id hoặc last_timestamp
+    last_run_at TIMESTAMPTZ
+);
+
 
 CREATE TABLE IF NOT EXISTS catalyst_flags (
   sa_silver_ref_id TEXT REFERENCES sa_silver(url_canonical),
