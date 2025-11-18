@@ -12,7 +12,7 @@ circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=600)
 # --- Configuration ---
 WATCHLIST = ["FPT", "TCB", "VNM"]
 NEWS_LOOKBACK_DAYS = 7
-PRICE_LOOKBACK_DAYS = 90 # Fetch last 3 months of data for now
+PRICE_LOOKBACK_DAYS = 90
 
 def check_backpressure() -> bool:
     """
@@ -42,14 +42,12 @@ def main():
     """Main entrypoint for the scraper worker."""
     print("Scraper worker starting...")
     source_name = "vnstock"
-
-    # Initialize the real data source
     source = VnStockSource()
 
+    # --- Backpressure Implementation ---
     if check_backpressure():
-        print("Backpressure enabled: scraper will run at 50% speed.")
-        # This can be implemented by adjusting rate_limiter settings if needed
-        # For now, it's just an informational message.
+        print("Backpressure enabled: Halving scrape rate to 30 reqs/minute.")
+        rate_limiter.set_requests_per_minute(30)
 
     # --- Fetch, Adapt, and Ingest Data ---
     for symbol in WATCHLIST:
@@ -70,17 +68,13 @@ def main():
 
             if raw_price_data:
                 for record in raw_price_data:
-                    # Adapt data to internal format
                     adapted_data = adapt_ta_data(record)
                     process_and_ingest_data(
                         raw_data=adapted_data.model_dump(),
                         source_name=source_name,
-                        task_kind="ta.bar" # Use the kind defined in silver_logic_v1
+                        task_kind="TA_PROCESS" # Updated Task Kind for V3.1
                     )
                 print(f"Successfully processed {len(raw_price_data)} price records for {symbol}.")
-            else:
-                print(f"No price data found for {symbol}.")
-
 
             # --- Fetch News Data (SA) ---
             rate_limiter.wait(f"{source_name}:{symbol}:news")
@@ -89,29 +83,22 @@ def main():
 
             if raw_news_data:
                 for article in raw_news_data:
-                    # Adapt data to internal format
-                    # We might need to adjust the adapter or the source mapping here.
-                    # For now, let's assume a direct pass-through after source fetch.
-                    # A proper adapter would be needed if vnstock doesn't provide all fields.
-                    # SAData requires: id, source, url, text, publisher_time, first_seen_time
                     article_payload = {
-                        "id": article.get("id", article.get("url")), # Use URL as ID if not present
-                        "source": article.get("source", source_name),
+                        "id": article.get("id"),
+                        "source": article.get("source"),
                         "url": article.get("url"),
-                        "text": article.get("text", article.get("title")), # Use title if text is missing
+                        "text": article.get("text"),
                         "publisher_time": article.get("published_at"),
                         "first_seen_time": article.get("first_seen_time"),
-                        "entities": [symbol] # Add the symbol as an entity
+                        "entities": [symbol]
                     }
                     adapted_data = adapt_sa_data(article_payload)
                     process_and_ingest_data(
                         raw_data=adapted_data.model_dump(),
                         source_name=source_name,
-                        task_kind="sa.article" # Use the kind defined in silver_logic_v1
+                        task_kind="NLP_PROCESS" # Updated Task Kind for V3.1
                     )
                 print(f"Successfully processed {len(raw_news_data)} news articles for {symbol}.")
-            else:
-                print(f"No news found for {symbol}.")
 
             circuit_breaker.record_success(f"{source_name}:{symbol}")
 
