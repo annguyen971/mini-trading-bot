@@ -11,6 +11,13 @@ class RateLimiter:
         self.interval = 60.0 / requests_per_minute
         self.timestamps: Dict[str, float] = defaultdict(float)
 
+    def set_requests_per_minute(self, new_rate: int):
+        """Allows dynamically updating the rate limit."""
+        if new_rate > 0:
+            self.requests_per_minute = new_rate
+            self.interval = 60.0 / new_rate
+            print(f"Rate limiter updated to {new_rate} requests per minute.")
+
     def wait(self, key: str = "default"):
         """Waits if necessary to respect the rate limit for a given key."""
         last_request_time = self.timestamps.get(key, 0)

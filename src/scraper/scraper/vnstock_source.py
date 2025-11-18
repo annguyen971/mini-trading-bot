@@ -3,10 +3,11 @@ from datetime import datetime, timedelta
 from typing import List
 import logging
 
-# Assuming vnstock3 is the correct package name
-from vnstock3 import Vnstock
+# Updated to use 'vnstock' library
+from vnstock import Vnstock
 
-from core_lib.core_lib.data_source import PriceSource, NewsSource
+# FIX: Corrected the import path to remove the extra 'core_lib'
+from core_lib.data_source import PriceSource, NewsSource
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 class VnStockSource(PriceSource, NewsSource):
     """
     An implementation of PriceSource and NewsSource using the vnstock library.
-    This version propagates exceptions to be handled by an upper layer (e.g., a circuit breaker).
+    This version propagates exceptions and uses safe data mapping.
     """
     def __init__(self):
         self.stock = Vnstock()
@@ -38,10 +39,9 @@ class VnStockSource(PriceSource, NewsSource):
                 logger.warning(f"No OHLCV data returned for {symbol}")
                 return []
 
-            # Data Mapping: Ensure column names match TAData model in adapters.py
             df_renamed = df.rename(columns={
                 'time': 'trade_date',
-                'value': 'turnover' # 'value' is aliased to 'turnover' in TAData
+                'value': 'turnover'
             })
 
             df_renamed['symbol'] = symbol
@@ -51,41 +51,47 @@ class VnStockSource(PriceSource, NewsSource):
 
         except Exception as e:
             logger.error(f"vnstock failed to fetch OHLCV for {symbol}: {e}")
-            # Re-raise the exception to allow the circuit breaker to catch it
             raise
 
     def fetch_latest_news(self, symbol: str, days: int) -> List[dict]:
         """
         Fetches the latest news for a symbol using vnstock.
-        Maps the vnstock DataFrame to the required internal format.
+        Uses safe .get() access for mapping to prevent KeyErrors.
         Raises exceptions on failure.
         """
         try:
             logger.info(f"Fetching latest news for {symbol} for the last {days} days")
-            # Fetch a reasonable number of recent news to filter from
-            news_df = self.stock.stock.news(symbol=symbol, page_size=30, page_num=1)
+            news_list = self.stock.stock.news(symbol=symbol, page_size=30, page_num=1)
 
-            if news_df is None or news_df.empty:
+            if not news_list:
                 logger.warning(f"No news data returned for {symbol}")
                 return []
 
-            # Data Mapping: Ensure column names match SAData model in adapters.py
-            news_df_renamed = news_df.rename(columns={
-                'description': 'text' # Using description as the main text content
-            })
+            processed_news = []
+            cutoff_date = datetime.now() - timedelta(days=days)
 
-            # Filter by date
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
-            news_df_renamed['published_at'] = pd.to_datetime(news_df_renamed['published_at'])
-            filtered_df = news_df_renamed[news_df_renamed['published_at'] >= start_date].copy()
+            for article in news_list:
+                published_at_str = article.get('published_at')
+                if not published_at_str:
+                    continue
 
-            # Add placeholder for first_seen_time, as vnstock doesn't provide it
-            filtered_df['first_seen_time'] = datetime.now()
+                published_at = pd.to_datetime(published_at_str)
+                if published_at < cutoff_date:
+                    continue
 
-            return filtered_df.to_dict('records')
+                processed_article = {
+                    'id': article.get('id', article.get('url', '')),
+                    'url': article.get('url', ''),
+                    'title': article.get('title', ''),
+                    'source': article.get('source', 'vnstock'),
+                    'text': article.get('description', ''),
+                    'published_at': published_at,
+                    'first_seen_time': datetime.now()
+                }
+                processed_news.append(processed_article)
+
+            return processed_news
 
         except Exception as e:
             logger.error(f"vnstock failed to fetch news for {symbol}: {e}")
-            # Re-raise the exception to allow the circuit breaker to catch it
             raise

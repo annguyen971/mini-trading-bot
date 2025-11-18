@@ -5,6 +5,6 @@ dependencies = [
     "httpx",
     "beautifulsoup4",
     "core-lib @ file://../core_lib",
-    "vnstock3",
+    "vnstock",
     "pandas",
 ]
