@@ -1,0 +1,121 @@
+# Stock Hunter AI - Production Crontab Configuration
+# ====================================================
+# Installation: crontab /home/duongtran/an-pj/mini-trading/source-code/crontab_hunter.txt
+# Verification: crontab -l
+# Logs: /home/duongtran/an-pj/mini-trading/source-code/logs/
+#
+# Format: minute hour day month weekday command
+# ====================================================
+
+# Project root directory
+PROJECT_ROOT=/home/duongtran/an-pj/mini-trading/source-code
+
+# === CRITICAL JOBS (Data Pipeline) ===
+
+# 1. Silver Worker Health Check (every 5 minutes)
+# - Ensures worker is processing tasks from task_q
+# - Restarts if stuck or crashed
+*/5 * * * * cd $PROJECT_ROOT && docker-compose ps worker | grep -q "Up" || docker-compose restart worker >> logs/worker_healthcheck.log 2>&1
+
+# 2. Feature Gold Pipeline (daily at 8:00 PM)
+# - Runs after market close (4 PM ET) + 4 hour data settlement
+# - Computes HMM states, FrothScore, HunterScore for all symbols
+# - Critical for next-day trading signals
+0 20 * * * cd $PROJECT_ROOT && docker-compose exec -T worker python -m worker.tasks_feature_gold >> logs/feature_gold.log 2>&1
+
+# === WEEKLY JOBS (Machine Learning) ===
+
+# 3. Weak Supervision Labeling (Mondays at 9:00 AM)
+# - Runs Snorkel label model on unlabeled samples
+# - Generates Active Learning queue (top 10 samples)
+# - Checks quality guardrails (abstain ≤40%, coverage ≥60%)
+0 9 * * 1 cd $PROJECT_ROOT && docker-compose exec -T worker python -m worker.tasks_label >> logs/labeling.log 2>&1
+
+# 4. Model Training Check (Mondays at 10:00 AM)
+# - Checks training triggers (PSI drift, IC drop, model age, new labels)
+# - Runs Walk-Forward Optimization if triggered
+# - Publishes new model to registry with metrics
+0 10 * * 1 cd $PROJECT_ROOT && docker-compose exec -T worker python -m worker.tasks_train >> logs/training.log 2>&1
+
+# === HOURLY MONITORING ===
+
+# 5. Metrics Collection (every hour at :00)
+# - Collects 20+ metrics (data quality, model perf, system health)
+# - Stores in monitoring_logs for Observability dashboard
+# - Cleans up metrics older than 90 days
+0 * * * * cd $PROJECT_ROOT && docker-compose exec -T worker python -m worker.monitor_metrics >> logs/metrics.log 2>&1
+
+# === MAINTENANCE JOBS ===
+
+# 6. Database Vacuum & Analyze (Sundays at 2:00 AM)
+# - Reclaims storage from deleted rows
+# - Updates table statistics for query planner
+# - Prevents table bloat
+0 2 * * 0 cd $PROJECT_ROOT && docker-compose exec -T db psql -U hunter -d hunter -c "VACUUM ANALYZE;" >> logs/vacuum.log 2>&1
+
+# 7. Log Rotation & Cleanup (daily at 3:00 AM)
+# - Deletes logs older than 30 days
+# - Prevents disk space issues
+# - Keeps logs directory < 1GB
+0 3 * * * find $PROJECT_ROOT/logs -name "*.log" -mtime +30 -delete
+
+# 8. Docker System Cleanup (Sundays at 4:00 AM)
+# - Removes unused images, containers, networks
+# - Reclaims disk space
+# - Keeps Docker lean
+0 4 * * 0 docker system prune -f >> $PROJECT_ROOT/logs/docker_prune.log 2>&1
+
+# === ALERTING (Optional - requires Slack/Email setup) ===
+
+# 9. High DLQ Rate Alert (every 30 minutes)
+# - Sends alert if DLQ rate > 15%
+# - Requires SLACK_WEBHOOK_URL in .env
+# - Uncomment when alerting is configured
+# */30 * * * * cd $PROJECT_ROOT && docker-compose exec -T db psql -U hunter -d hunter -c "SELECT COUNT(*) FROM task_q_dlq WHERE moved_at > NOW() - interval '1 hour';" | awk 'NR==3 {if ($1 > 100) system("curl -X POST $SLACK_WEBHOOK_URL -d '\''payload={\"text\":\"⚠️ High DLQ rate: \'' $1 '\'' failures in last hour\"}'\''")}'
+
+# 10. Model Performance Degradation Alert (daily at 6:00 PM)
+# - Checks if IC < 0.02 or Sharpe < 0.5
+# - Triggers manual review
+# - Uncomment when alerting is configured
+# 0 18 * * * cd $PROJECT_ROOT && docker-compose exec -T worker python -m worker.check_model_health >> logs/model_health.log 2>&1
+
+# === BACKUP JOBS (Recommended for Production) ===
+
+# 11. Database Backup (daily at 1:00 AM)
+# - Full backup of PostgreSQL database
+# - Stores in backups/ directory
+# - Keeps last 7 days
+0 1 * * * cd $PROJECT_ROOT && docker-compose exec -T db pg_dump -U hunter hunter | gzip > backups/hunter_db_$(date +\%Y\%m\%d).sql.gz && find $PROJECT_ROOT/backups -name "*.sql.gz" -mtime +7 -delete
+
+# 12. Model Artifacts Backup (weekly on Sundays at 5:00 AM)
+# - Backs up model registry and trained models
+# - Stores in backups/models/
+# - Keeps last 4 weeks
+0 5 * * 0 cd $PROJECT_ROOT && tar -czf backups/models/artifacts_$(date +\%Y\%m\%d).tar.gz artifacts/ && find $PROJECT_ROOT/backups/models -name "*.tar.gz" -mtime +28 -delete
+
+# ====================================================
+# END OF CRONTAB
+# ====================================================
+#
+# Installation Steps:
+# 1. Create log directories:
+#    mkdir -p /home/duongtran/an-pj/mini-trading/source-code/logs
+#    mkdir -p /home/duongtran/an-pj/mini-trading/source-code/backups
+#    mkdir -p /home/duongtran/an-pj/mini-trading/source-code/backups/models
+#
+# 2. Install crontab:
+#    crontab /home/duongtran/an-pj/mini-trading/source-code/crontab_hunter.txt
+#
+# 3. Verify installation:
+#    crontab -l
+#
+# 4. Monitor cron execution:
+#    tail -f /var/log/syslog | grep CRON
+#
+# Troubleshooting:
+# - If cron jobs don't run, check cron service: systemctl status cron
+# - Check cron logs: grep CRON /var/log/syslog
+# - Test command manually before adding to crontab
+# - Ensure docker-compose is in PATH: which docker-compose
+#
+# ====================================================

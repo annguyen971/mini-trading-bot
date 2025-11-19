@@ -1,0 +1,33 @@
+# NFR6: 60-Day Retention Policy Cleanup
+# Runs weekly (Sundays at 3 AM) to delete old unlicensed content
+# Prevents legal/licensing violations
+
+0 3 * * 0 docker compose exec -T db psql -U hunter -d hunter << 'EOF'
+-- Delete sa_silver records older than 60 days (unlicensed full-text content)
+DELETE FROM sa_silver
+WHERE validated_at < NOW() - INTERVAL '60 days';
+
+-- Delete associated catalyst flags (orphaned references)
+DELETE FROM catalyst_flags
+WHERE sa_silver_ref_id NOT IN (SELECT url_canonical FROM sa_silver);
+
+-- Log cleanup metrics
+INSERT INTO monitoring_logs (metric_name, value, metadata)
+VALUES (
+    'retention_cleanup_sa_silver',
+    (SELECT COUNT(*) FROM sa_silver WHERE validated_at >= NOW() - INTERVAL '60 days'),
+    jsonb_build_object('cleanup_date', NOW(), 'retention_days', 60)
+);
+
+-- Vacuum to reclaim space
+VACUUM ANALYZE sa_silver;
+VACUUM ANALYZE catalyst_flags;
+
+-- Summary
+SELECT
+    'Retention cleanup complete' as status,
+    COUNT(*) as remaining_records,
+    MIN(validated_at) as oldest_record,
+    MAX(validated_at) as newest_record
+FROM sa_silver;
+EOF

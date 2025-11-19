@@ -1,14 +1,177 @@
 import os
 import hashlib
 from datetime import datetime, timedelta, timezone
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Response, status, Request
 from pydantic import BaseModel, condecimal
 from datetime import date
 import psycopg
 from core_lib.db import get_db_connection
 import pickle
+from collections import defaultdict
+import time
 
 app = FastAPI()
+
+# ============================================================================
+# RATE LIMITING (NFR5: 100 req/hour/IP for public endpoints)
+# ============================================================================
+
+class SimpleRateLimiter:
+    """In-memory rate limiter for NFR5 compliance."""
+
+    def __init__(self):
+        self.requests = defaultdict(list)  # {ip: [timestamp1, timestamp2, ...]}
+
+    def is_allowed(self, ip: str, max_requests: int = 100, window_seconds: int = 3600) -> bool:
+        """
+        Check if IP is within rate limit.
+
+        Args:
+            ip: Client IP address
+            max_requests: Maximum requests allowed (default: 100)
+            window_seconds: Time window in seconds (default: 3600 = 1 hour)
+
+        Returns:
+            True if allowed, False if rate limit exceeded
+        """
+        now = time.time()
+
+        # Clean old requests outside window
+        self.requests[ip] = [
+            req_time for req_time in self.requests[ip]
+            if now - req_time < window_seconds
+        ]
+
+        # Check limit
+        if len(self.requests[ip]) >= max_requests:
+            return False
+
+        # Record request
+        self.requests[ip].append(now)
+        return True
+
+# Initialize rate limiter
+rate_limiter = SimpleRateLimiter()
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """
+    Rate limiting middleware for public endpoints.
+    NFR5: 100 requests/hour/IP for /predict endpoint.
+    """
+    # Only apply to public prediction endpoint
+    if request.url.path == "/predict":
+        # Get client IP
+        client_ip = request.client.host if request.client else "unknown"
+
+        # Check rate limit
+        if not rate_limiter.is_allowed(client_ip, max_requests=100, window_seconds=3600):
+            return Response(
+                content='{"detail":"Rate limit exceeded. Maximum 100 requests per hour per IP."}',
+                status_code=429,
+                media_type="application/json"
+            )
+
+    response = await call_next(request)
+    return response
+
+
+# ============================================================================
+# LATENCY MONITORING (NFR1: p95 < 500ms)
+# ============================================================================
+
+class LatencyTracker:
+    """Tracks API latency for NFR1 compliance monitoring."""
+
+    def __init__(self):
+        self.latencies = defaultdict(list)  # {endpoint: [latency_ms, ...]}
+        self.max_samples = 1000  # Keep last 1000 requests per endpoint
+
+    def record(self, endpoint: str, latency_ms: float):
+        """Record latency for an endpoint."""
+        self.latencies[endpoint].append(latency_ms)
+
+        # Keep only recent samples
+        if len(self.latencies[endpoint]) > self.max_samples:
+            self.latencies[endpoint] = self.latencies[endpoint][-self.max_samples:]
+
+    def get_p95(self, endpoint: str) -> float:
+        """Calculate p95 latency for endpoint."""
+        if not self.latencies[endpoint]:
+            return 0.0
+
+        sorted_latencies = sorted(self.latencies[endpoint])
+        p95_index = int(len(sorted_latencies) * 0.95)
+        return sorted_latencies[p95_index] if p95_index < len(sorted_latencies) else sorted_latencies[-1]
+
+    def get_stats(self, endpoint: str) -> dict:
+        """Get latency statistics."""
+        if not self.latencies[endpoint]:
+            return {"count": 0, "p50": 0, "p95": 0, "p99": 0, "max": 0}
+
+        sorted_latencies = sorted(self.latencies[endpoint])
+        count = len(sorted_latencies)
+
+        return {
+            "count": count,
+            "p50": sorted_latencies[int(count * 0.50)],
+            "p95": sorted_latencies[int(count * 0.95)],
+            "p99": sorted_latencies[int(count * 0.99)] if count > 100 else sorted_latencies[-1],
+            "max": sorted_latencies[-1]
+        }
+
+# Initialize latency tracker
+latency_tracker = LatencyTracker()
+
+
+@app.middleware("http")
+async def latency_monitoring_middleware(request: Request, call_next):
+    """
+    Latency monitoring middleware for NFR1 compliance.
+    Tracks request latency and logs to monitoring_logs every 100 requests.
+    """
+    start_time = time.time()
+
+    response = await call_next(request)
+
+    # Calculate latency
+    latency_ms = (time.time() - start_time) * 1000
+
+    # Record latency
+    endpoint = request.url.path
+    latency_tracker.record(endpoint, latency_ms)
+
+    # Add latency header for debugging
+    response.headers["X-Response-Time"] = f"{latency_ms:.2f}ms"
+
+    # Log to database every 100 requests for /predict endpoint
+    if endpoint == "/predict" and len(latency_tracker.latencies[endpoint]) % 100 == 0:
+        try:
+            stats = latency_tracker.get_stats(endpoint)
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO monitoring_logs (metric_name, value, metadata)
+                    VALUES
+                        ('api_latency_p50_ms', %s, %s::jsonb),
+                        ('api_latency_p95_ms', %s, %s::jsonb),
+                        ('api_latency_p99_ms', %s, %s::jsonb)
+                """, (
+                    stats['p50'], f'{{"endpoint": "{endpoint}"}}',
+                    stats['p95'], f'{{"endpoint": "{endpoint}", "threshold": 500}}',
+                    stats['p99'], f'{{"endpoint": "{endpoint}"}}'
+                ))
+            conn.commit()
+            conn.close()
+
+            # Warn if p95 exceeds threshold
+            if stats['p95'] > 500:
+                print(f"⚠️  WARNING: /predict p95 latency ({stats['p95']:.1f}ms) exceeds NFR1 threshold (500ms)")
+
+        except Exception as e:
+            print(f"Latency logging failed: {e}")
+
+    return response
 
 MACRO_TZ = os.getenv("MACRO_TZ", "Asia/Ho_Chi_Minh")
 
@@ -63,11 +226,13 @@ async def startup_event():
             cur.execute("SELECT file_path, artifact_sha256, model_version, metadata FROM model_registry WHERE is_active = true LIMIT 1")
             active_model = cur.fetchone()
 
-            # --- SỬA LỖI 1 (IndentationError) ---
+            # --- CRITICAL: Fail-fast if no active model (Production Fix) ---
             if not active_model:
-                print("WARN: No active model found. API will start without a model.")
-                pass # Cho phép API tiếp tục chạy
-            # --- HẾT SỬA LỖI 1 ---
+                error_msg = "CRITICAL: No active model found in model_registry. Cannot start API without a model."
+                print(error_msg)
+                print("HINT: Seed a model first via db/migrations/003_seed_default_model.sql or run training pipeline")
+                raise RuntimeError(error_msg)
+            # --- END CRITICAL CHECK ---
             else:
                 model_path = active_model['file_path']
                 expected_hash = active_model['artifact_sha256']
@@ -545,3 +710,350 @@ async def submit_al_label(label: AlLabelInput):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if conn: conn.close()
+
+
+# ==============================================================================
+# WATCHLIST MANAGEMENT ENDPOINTS (P0 - Dynamic Watchlist)
+# ==============================================================================
+
+class WatchlistSymbol(BaseModel):
+    """Schema for adding/updating symbols in watchlist."""
+    symbol: str
+    sector: str  # 'technology', 'banking', 'consumer_goods', 'industrial', 'real_estate', 'utilities'
+    market_cap_tier: str = None  # Optional: 'large', 'mid', 'small'
+
+
+@app.get("/admin/watchlist")
+async def get_watchlist(
+    user_id: str = "admin",
+    include_inactive: bool = False,
+    admin_key: str = Depends(verify_admin_key)
+):
+    """
+    Get watchlist for a user.
+
+    Args:
+        user_id: User ID (default: 'admin')
+        include_inactive: Include inactive symbols (default: False)
+        admin_key: Admin authentication key (from header)
+
+    Returns:
+        List of watchlist symbols with metadata
+
+    Example:
+        GET /admin/watchlist
+        Headers: X-ADMIN-KEY: your_admin_key
+
+        Response:
+        [
+            {
+                "id": 1,
+                "symbol": "FPT",
+                "sector": "technology",
+                "market_cap_tier": null,
+                "is_active": true,
+                "added_at": "2025-01-18T10:00:00Z"
+            },
+            ...
+        ]
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            if include_inactive:
+                cur.execute("""
+                    SELECT id, symbol, sector, market_cap_tier, is_active, added_at, updated_at
+                    FROM symbol_watchlist
+                    WHERE user_id = %s
+                    ORDER BY symbol
+                """, (user_id,))
+            else:
+                cur.execute("""
+                    SELECT id, symbol, sector, market_cap_tier, is_active, added_at, updated_at
+                    FROM symbol_watchlist
+                    WHERE user_id = %s AND is_active = true
+                    ORDER BY symbol
+                """, (user_id,))
+
+            symbols = cur.fetchall()
+            return {
+                "user_id": user_id,
+                "count": len(symbols),
+                "symbols": symbols
+            }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch watchlist: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.post("/admin/watchlist")
+async def add_to_watchlist(
+    data: WatchlistSymbol,
+    user_id: str = "admin",
+    admin_key: str = Depends(verify_admin_key)
+):
+    """
+    Add symbol to watchlist (or reactivate if exists).
+
+    Args:
+        data: Symbol data (symbol, sector, market_cap_tier)
+        user_id: User ID (default: 'admin')
+        admin_key: Admin authentication key (from header)
+
+    Returns:
+        Status and symbol info
+
+    Example:
+        POST /admin/watchlist
+        Headers: X-ADMIN-KEY: your_admin_key
+        Body:
+        {
+            "symbol": "HPG",
+            "sector": "industrial",
+            "market_cap_tier": "large"
+        }
+
+        Response:
+        {
+            "status": "added",
+            "symbol": "HPG",
+            "message": "Symbol HPG added to watchlist"
+        }
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            # Validate sector
+            valid_sectors = ['technology', 'banking', 'consumer_goods', 'industrial', 'real_estate', 'utilities']
+            if data.sector not in valid_sectors:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid sector. Must be one of: {', '.join(valid_sectors)}"
+                )
+
+            # Check current watchlist size (NFR10: max 500 symbols)
+            cur.execute("SELECT COUNT(*) FROM symbol_watchlist WHERE user_id = %s AND is_active = true", (user_id,))
+            current_count = cur.fetchone()[0]
+
+            if current_count >= 500:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Watchlist full. Maximum 500 active symbols allowed (NFR10)"
+                )
+
+            # UPSERT: Add or reactivate symbol
+            cur.execute("""
+                INSERT INTO symbol_watchlist (user_id, symbol, sector, market_cap_tier, is_active, added_at, updated_at)
+                VALUES (%s, %s, %s, %s, true, NOW(), NOW())
+                ON CONFLICT (user_id, symbol)
+                DO UPDATE SET
+                    sector = EXCLUDED.sector,
+                    market_cap_tier = EXCLUDED.market_cap_tier,
+                    is_active = true,
+                    updated_at = NOW()
+                RETURNING id
+            """, (user_id, data.symbol.upper(), data.sector, data.market_cap_tier))
+
+            symbol_id = cur.fetchone()[0]
+            conn.commit()
+
+            return {
+                "status": "added",
+                "symbol": data.symbol.upper(),
+                "sector": data.sector,
+                "id": symbol_id,
+                "message": f"Symbol {data.symbol.upper()} added to watchlist (total: {current_count + 1}/500)"
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to add symbol: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.delete("/admin/watchlist/{symbol}")
+async def remove_from_watchlist(
+    symbol: str,
+    user_id: str = "admin",
+    permanent: bool = False,
+    admin_key: str = Depends(verify_admin_key)
+):
+    """
+    Remove symbol from watchlist (soft delete by default).
+
+    Args:
+        symbol: Symbol to remove (e.g., "FPT")
+        user_id: User ID (default: 'admin')
+        permanent: Hard delete if True, soft delete if False (default: False)
+        admin_key: Admin authentication key (from header)
+
+    Returns:
+        Status and message
+
+    Example:
+        DELETE /admin/watchlist/FPT?permanent=false
+        Headers: X-ADMIN-KEY: your_admin_key
+
+        Response:
+        {
+            "status": "removed",
+            "symbol": "FPT",
+            "permanent": false,
+            "message": "Symbol FPT deactivated (can be reactivated later)"
+        }
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            if permanent:
+                # Hard delete
+                cur.execute("""
+                    DELETE FROM symbol_watchlist
+                    WHERE user_id = %s AND symbol = %s
+                    RETURNING id
+                """, (user_id, symbol.upper()))
+            else:
+                # Soft delete (set is_active = false)
+                cur.execute("""
+                    UPDATE symbol_watchlist
+                    SET is_active = false, updated_at = NOW()
+                    WHERE user_id = %s AND symbol = %s
+                    RETURNING id
+                """, (user_id, symbol.upper()))
+
+            result = cur.fetchone()
+
+            if not result:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Symbol {symbol.upper()} not found in watchlist for user {user_id}"
+                )
+
+            conn.commit()
+
+            return {
+                "status": "removed",
+                "symbol": symbol.upper(),
+                "permanent": permanent,
+                "message": f"Symbol {symbol.upper()} {'permanently deleted' if permanent else 'deactivated (can be reactivated later)'}"
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to remove symbol: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get("/admin/watchlist/stats")
+async def get_watchlist_stats(
+    user_id: str = "admin",
+    admin_key: str = Depends(verify_admin_key)
+):
+    """
+    Get watchlist statistics and compliance status.
+
+    Args:
+        user_id: User ID (default: 'admin')
+        admin_key: Admin authentication key (from header)
+
+    Returns:
+        Statistics about the watchlist
+
+    Example:
+        GET /admin/watchlist/stats
+        Headers: X-ADMIN-KEY: your_admin_key
+
+        Response:
+        {
+            "user_id": "admin",
+            "total_symbols": 10,
+            "active_symbols": 10,
+            "inactive_symbols": 0,
+            "by_sector": {
+                "technology": 2,
+                "banking": 4,
+                "consumer_goods": 1,
+                "industrial": 1,
+                "real_estate": 2
+            },
+            "capacity_used_pct": 2.0,
+            "max_symbols": 500,
+            "compliance": {
+                "nfr10_compliant": true,
+                "warning": null
+            }
+        }
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            # Total counts
+            cur.execute("""
+                SELECT
+                    COUNT(*) as total,
+                    COUNT(*) FILTER (WHERE is_active = true) as active,
+                    COUNT(*) FILTER (WHERE is_active = false) as inactive
+                FROM symbol_watchlist
+                WHERE user_id = %s
+            """, (user_id,))
+            counts = cur.fetchone()
+
+            # By sector
+            cur.execute("""
+                SELECT sector, COUNT(*) as count
+                FROM symbol_watchlist
+                WHERE user_id = %s AND is_active = true
+                GROUP BY sector
+                ORDER BY count DESC
+            """, (user_id,))
+            sectors = {row['sector']: row['count'] for row in cur.fetchall()}
+
+            max_symbols = 500
+            active_count = counts['active']
+            capacity_pct = (active_count / max_symbols) * 100
+
+            # Compliance check (NFR10: ≤ 500 symbols)
+            compliant = active_count <= max_symbols
+            warning = None
+
+            if capacity_pct >= 90:
+                warning = f"Approaching limit: {active_count}/{max_symbols} symbols"
+            elif capacity_pct >= 100:
+                warning = f"LIMIT EXCEEDED: {active_count}/{max_symbols} symbols (NFR10 violation)"
+
+            return {
+                "user_id": user_id,
+                "total_symbols": counts['total'],
+                "active_symbols": active_count,
+                "inactive_symbols": counts['inactive'],
+                "by_sector": sectors,
+                "capacity_used_pct": round(capacity_pct, 2),
+                "max_symbols": max_symbols,
+                "compliance": {
+                    "nfr10_compliant": compliant,
+                    "warning": warning
+                }
+            }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+    finally:
+        if conn:
+            conn.close()

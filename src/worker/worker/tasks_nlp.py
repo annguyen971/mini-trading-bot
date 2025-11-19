@@ -136,36 +136,125 @@ def run_nlp_pipeline():
         return  # Exit if another process has the lock
 
     try:
-        # 1. Fetch data from raw_bronze (placeholder - replace with actual DB query)
-        #    In a real scenario, this would fetch records from the `raw_bronze` table
-        #    where the NLP results are pending.
-        raw_docs = [
-            ("doc_1", "Tin tức tuyệt vời cho VNM, KQKD vượt kỳ vọng, lợi nhuận đột biến!"),
-            ("doc_2", "FPT công bố kế hoạch sáp nhập và mua lại (M&A) công ty công nghệ ABC."),
-            ("doc_3", "Giá cổ phiếu HPG có vẻ không ổn định trong tuần này."),
-            ("doc_4", "Thị trường chung đang có dấu hiệu tiêu cực, nhiều nhà đầu tư lo ngại."),
-        ]
+        # 1. Fetch unprocessed news from sa_silver (needs NLP)
+        print("Fetching unprocessed news articles from sa_silver...")
+
+        with conn.cursor() as cur:
+            # Get articles that don't have sentiment_score yet
+            cur.execute("""
+                SELECT
+                    url_canonical,
+                    source_name,
+                    publisher_time_utc,
+                    bronze_ref_id
+                FROM sa_silver
+                WHERE sentiment_score IS NULL
+                  AND validated_at > NOW() - INTERVAL '7 days'
+                ORDER BY publisher_time_utc DESC
+                LIMIT 200
+            """)
+
+            pending_articles = cur.fetchall()
+
+            if not pending_articles:
+                print("No articles pending NLP processing.")
+                return
+
+            print(f"Found {len(pending_articles)} articles pending NLP processing")
+
+            # Fetch full text from raw_bronze via bronze_ref_id
+            raw_docs = []
+            for article in pending_articles:
+                url_canonical, source_name, pub_time, bronze_id = article
+
+                if not bronze_id:
+                    print(f"  Skipping {url_canonical} - no bronze_ref_id")
+                    continue
+
+                # Get full text from raw_bronze
+                cur.execute("""
+                    SELECT payload_json->>'text', payload_json->>'title'
+                    FROM raw_bronze
+                    WHERE id = %s
+                """, (bronze_id,))
+
+                bronze_row = cur.fetchone()
+                if bronze_row and bronze_row[0]:
+                    text, title = bronze_row
+                    # Combine title and text for NLP
+                    full_text = f"{title}. {text}" if title else text
+                    raw_docs.append((url_canonical, full_text))
+                else:
+                    print(f"  Warning: No text found in raw_bronze for {url_canonical}")
+
+        if not raw_docs:
+            print("No valid documents with text to process.")
+            return
+
+        print(f"Prepared {len(raw_docs)} documents for NLP processing")
 
         # 2. Process documents in batches
+        total_processed = 0
+        total_failed = 0
+
         for i in range(0, len(raw_docs), NLP_BATCH_SIZE):
             batch_docs = raw_docs[i:i + NLP_BATCH_SIZE]
-            print(f"\n--- Processing batch {i//NLP_BATCH_SIZE + 1} ---")
+            batch_num = i//NLP_BATCH_SIZE + 1
+            print(f"\n--- Processing batch {batch_num} ({len(batch_docs)} docs) ---")
 
             results = process_nlp_batch(batch_docs)
 
             if not results:
-                print(f"Batch {i//NLP_BATCH_SIZE + 1} failed. Skipping to next batch.")
+                print(f"Batch {batch_num} failed. Skipping to next batch.")
+                total_failed += len(batch_docs)
                 continue
 
-            # 3. Save results to Silver tables (placeholder for DB operations)
-            for result in results:
-                print(f"Result for {result['doc_id']}:")
-                print(f"  Sentiment Score: {result.get('sentiment_score')}")
-                print(f"  Catalysts: {result.get('catalysts')}")
-                print(f"  Summary: {result.get('summary')}")
-                # Here, you would execute INSERT/UPDATE statements to save these
-                # results into the `sa_silver` and `catalyst_flags` tables,
-                # linking them via the `doc_id`.
+            # 3. Save results to sa_silver and catalyst_flags tables
+            with conn.cursor() as cur:
+                for result in results:
+                    url_canonical = result['doc_id']
+                    sentiment_score = result.get('sentiment_score')
+                    catalysts = result.get('catalysts', [])
+
+                    try:
+                        # Update sa_silver with sentiment_score
+                        cur.execute("""
+                            UPDATE sa_silver
+                            SET sentiment_score = %s
+                            WHERE url_canonical = %s
+                        """, (sentiment_score, url_canonical))
+
+                        # Insert catalysts into catalyst_flags
+                        if catalysts:
+                            for catalyst in catalysts:
+                                catalyst_type = catalyst.get('type', 'UNKNOWN')
+                                catalyst_value = catalyst.get('value', 1.0)
+
+                                cur.execute("""
+                                    INSERT INTO catalyst_flags
+                                        (sa_silver_ref_id, flag_name, value, as_of_time, validated_at)
+                                    VALUES (%s, %s, %s, NOW(), NOW())
+                                    ON CONFLICT (sa_silver_ref_id, flag_name)
+                                    DO UPDATE SET
+                                        value = EXCLUDED.value,
+                                        validated_at = NOW()
+                                """, (url_canonical, catalyst_type, catalyst_value))
+
+                        total_processed += 1
+
+                        print(f"  ✓ {url_canonical}: sentiment={sentiment_score:.2f}, catalysts={len(catalysts)}")
+
+                    except Exception as e:
+                        print(f"  ✗ Failed to save {url_canonical}: {e}")
+                        total_failed += 1
+
+            # Commit after each batch
+            conn.commit()
+
+        print(f"\n=== NLP Pipeline Summary ===")
+        print(f"Total processed: {total_processed}")
+        print(f"Total failed: {total_failed}")
+        print(f"Success rate: {total_processed/(total_processed+total_failed)*100:.1f}%" if (total_processed+total_failed) > 0 else "N/A")
 
         conn.commit()
 

@@ -270,3 +270,63 @@ ALTER TABLE macro_ui_override ADD CONSTRAINT chk_ttl_future CHECK (ttl_until IS 
 
 
 -- (Point 7) Retention Policy: Lên lịch (schedule) một cron job (ví dụ: hàng tháng) để chạy DELETE FROM macro_impact_rt WHERE as_of_date < (CURRENT_DATE - INTERVAL '1095 days');
+
+-- ==== USER & WATCHLIST MANAGEMENT (P0 - Dynamic Watchlist) ====
+CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    role TEXT DEFAULT 'admin',  -- Single admin user for MVP
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS symbol_watchlist (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT REFERENCES users(user_id) ON DELETE CASCADE,
+    symbol TEXT NOT NULL,
+    sector TEXT,  -- 'technology', 'banking', 'consumer_goods', 'industrial', 'real_estate', 'utilities'
+    market_cap_tier TEXT,  -- 'large', 'mid', 'small' (optional)
+    is_active BOOLEAN DEFAULT true,
+    added_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_symbol_watchlist_user_active ON symbol_watchlist(user_id, is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_symbol_watchlist_symbol ON symbol_watchlist(symbol);
+
+-- Seed admin user
+INSERT INTO users (user_id, username, role)
+VALUES ('admin', 'admin', 'admin')
+ON CONFLICT (user_id) DO NOTHING;
+
+-- Seed initial watchlist (Vietnamese market blue-chips)
+INSERT INTO symbol_watchlist (user_id, symbol, sector, is_active)
+VALUES
+    ('admin', 'FPT', 'technology', true),
+    ('admin', 'TCB', 'banking', true),
+    ('admin', 'VNM', 'consumer_goods', true),
+    ('admin', 'HPG', 'industrial', true),
+    ('admin', 'VHM', 'real_estate', true),
+    ('admin', 'VIC', 'real_estate', true),
+    ('admin', 'VCB', 'banking', true),
+    ('admin', 'MBB', 'banking', true),
+    ('admin', 'VPB', 'banking', true),
+    ('admin', 'GAS', 'utilities', true)
+ON CONFLICT (user_id, symbol) DO NOTHING;
+
+-- ==== LEGAL COMPLIANCE (P0 - robots.txt tracking) ====
+CREATE TABLE IF NOT EXISTS robots_txt_cache (
+    domain TEXT PRIMARY KEY,
+    robots_content TEXT,  -- Full robots.txt content
+    crawl_delay_seconds INT DEFAULT 1,  -- Extracted Crawl-delay
+    is_fetch_allowed BOOLEAN DEFAULT true,  -- Can we scrape this domain?
+    user_agent TEXT DEFAULT '*',  -- Which user-agent rules apply
+    last_fetched TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '7 days')  -- Refresh weekly
+);
+CREATE INDEX IF NOT EXISTS idx_robots_cache_expires ON robots_txt_cache(expires_at);
+
+-- Seed known sources (vnstock API - no robots.txt needed as it's an API wrapper)
+INSERT INTO robots_txt_cache (domain, crawl_delay_seconds, is_fetch_allowed, user_agent, last_fetched)
+VALUES
+    ('vnstock-api', 1, true, 'StockHunterBot/1.0', NOW())
+ON CONFLICT (domain) DO NOTHING;
