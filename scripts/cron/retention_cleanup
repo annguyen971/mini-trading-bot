@@ -1,8 +1,14 @@
+#!/bin/sh
 # NFR6: 60-Day Retention Policy Cleanup
 # Runs weekly (Sundays at 3 AM) to delete old unlicensed content
 # Prevents legal/licensing violations
 
-0 3 * * 0 docker compose exec -T db psql -U hunter -d hunter << 'EOF'
+# Wait for DB to be ready (optional but good practice)
+# sleep 10
+
+echo "Running retention cleanup..."
+
+docker exec -i db psql -U hunter -d hunter << 'EOF'
 -- Delete sa_silver records older than 60 days (unlicensed full-text content)
 DELETE FROM sa_silver
 WHERE validated_at < NOW() - INTERVAL '60 days';

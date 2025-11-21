@@ -25,8 +25,8 @@ class SAData(BaseModel):
     id: str
     source: str
     author: Optional[str] = None
-    url: str
-    text: str
+    url: Optional[str] = ""
+    text: Optional[str] = ""
     publisher_time: datetime
     first_seen_time: datetime
     entities: Optional[List[str]] = []

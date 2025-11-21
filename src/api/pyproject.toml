@@ -5,4 +5,6 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "core-lib @ file://../core_lib",
+    "slowapi",
+    "prometheus-fastapi-instrumentator",
 ]

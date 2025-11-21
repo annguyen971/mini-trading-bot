@@ -1,8 +1,8 @@
 # Use an official Python runtime as a parent image
 FROM python:3.11-slim
-RUN apt-get update && \
-    apt-get install -y wget && \
-    rm -rf /var/lib/apt/lists/*# Set the working directory in the container
+
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Copy the project files into the container
@@ -13,7 +13,7 @@ COPY . .
 RUN pip install ./core_lib
 
 # 2. Cài đặt các thư viện public của 'api' (từ pyproject.toml)
-RUN pip install fastapi uvicorn gunicorn
+RUN pip install fastapi uvicorn gunicorn slowapi prometheus-fastapi-instrumentator google-generativeai
 # 3. Cài đặt 'api' mà KHÔNG KIỂM TRA dependency (vì ta đã cài)
 RUN pip install --no-deps ./api
 # ---> HẾT SỬA LỖI <---

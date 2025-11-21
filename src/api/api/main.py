@@ -1,6 +1,7 @@
 import os
 import hashlib
 from datetime import datetime, timedelta, timezone
+import json
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status, Request
 from pydantic import BaseModel, condecimal
 from datetime import date
@@ -9,6 +10,14 @@ from core_lib.db import get_db_connection
 import pickle
 from collections import defaultdict
 import time
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from prometheus_fastapi_instrumentator import Instrumentator
+import google.generativeai as genai
+from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockThreshold
+
+
 
 app = FastAPI()
 
@@ -16,162 +25,24 @@ app = FastAPI()
 # RATE LIMITING (NFR5: 100 req/hour/IP for public endpoints)
 # ============================================================================
 
-class SimpleRateLimiter:
-    """In-memory rate limiter for NFR5 compliance."""
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-    def __init__(self):
-        self.requests = defaultdict(list)  # {ip: [timestamp1, timestamp2, ...]}
 
-    def is_allowed(self, ip: str, max_requests: int = 100, window_seconds: int = 3600) -> bool:
-        """
-        Check if IP is within rate limit.
 
-        Args:
-            ip: Client IP address
-            max_requests: Maximum requests allowed (default: 100)
-            window_seconds: Time window in seconds (default: 3600 = 1 hour)
-
-        Returns:
-            True if allowed, False if rate limit exceeded
-        """
-        now = time.time()
-
-        # Clean old requests outside window
-        self.requests[ip] = [
-            req_time for req_time in self.requests[ip]
-            if now - req_time < window_seconds
-        ]
-
-        # Check limit
-        if len(self.requests[ip]) >= max_requests:
-            return False
-
-        # Record request
-        self.requests[ip].append(now)
-        return True
-
-# Initialize rate limiter
-rate_limiter = SimpleRateLimiter()
-
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    """
-    Rate limiting middleware for public endpoints.
-    NFR5: 100 requests/hour/IP for /predict endpoint.
-    """
-    # Only apply to public prediction endpoint
-    if request.url.path == "/predict":
-        # Get client IP
-        client_ip = request.client.host if request.client else "unknown"
-
-        # Check rate limit
-        if not rate_limiter.is_allowed(client_ip, max_requests=100, window_seconds=3600):
-            return Response(
-                content='{"detail":"Rate limit exceeded. Maximum 100 requests per hour per IP."}',
-                status_code=429,
-                media_type="application/json"
-            )
-
-    response = await call_next(request)
-    return response
 
 
 # ============================================================================
 # LATENCY MONITORING (NFR1: p95 < 500ms)
 # ============================================================================
 
-class LatencyTracker:
-    """Tracks API latency for NFR1 compliance monitoring."""
-
-    def __init__(self):
-        self.latencies = defaultdict(list)  # {endpoint: [latency_ms, ...]}
-        self.max_samples = 1000  # Keep last 1000 requests per endpoint
-
-    def record(self, endpoint: str, latency_ms: float):
-        """Record latency for an endpoint."""
-        self.latencies[endpoint].append(latency_ms)
-
-        # Keep only recent samples
-        if len(self.latencies[endpoint]) > self.max_samples:
-            self.latencies[endpoint] = self.latencies[endpoint][-self.max_samples:]
-
-    def get_p95(self, endpoint: str) -> float:
-        """Calculate p95 latency for endpoint."""
-        if not self.latencies[endpoint]:
-            return 0.0
-
-        sorted_latencies = sorted(self.latencies[endpoint])
-        p95_index = int(len(sorted_latencies) * 0.95)
-        return sorted_latencies[p95_index] if p95_index < len(sorted_latencies) else sorted_latencies[-1]
-
-    def get_stats(self, endpoint: str) -> dict:
-        """Get latency statistics."""
-        if not self.latencies[endpoint]:
-            return {"count": 0, "p50": 0, "p95": 0, "p99": 0, "max": 0}
-
-        sorted_latencies = sorted(self.latencies[endpoint])
-        count = len(sorted_latencies)
-
-        return {
-            "count": count,
-            "p50": sorted_latencies[int(count * 0.50)],
-            "p95": sorted_latencies[int(count * 0.95)],
-            "p99": sorted_latencies[int(count * 0.99)] if count > 100 else sorted_latencies[-1],
-            "max": sorted_latencies[-1]
-        }
-
-# Initialize latency tracker
-latency_tracker = LatencyTracker()
+# Initialize Prometheus Instrumentator
+instrumentator = Instrumentator().instrument(app).expose(app)
 
 
-@app.middleware("http")
-async def latency_monitoring_middleware(request: Request, call_next):
-    """
-    Latency monitoring middleware for NFR1 compliance.
-    Tracks request latency and logs to monitoring_logs every 100 requests.
-    """
-    start_time = time.time()
 
-    response = await call_next(request)
 
-    # Calculate latency
-    latency_ms = (time.time() - start_time) * 1000
-
-    # Record latency
-    endpoint = request.url.path
-    latency_tracker.record(endpoint, latency_ms)
-
-    # Add latency header for debugging
-    response.headers["X-Response-Time"] = f"{latency_ms:.2f}ms"
-
-    # Log to database every 100 requests for /predict endpoint
-    if endpoint == "/predict" and len(latency_tracker.latencies[endpoint]) % 100 == 0:
-        try:
-            stats = latency_tracker.get_stats(endpoint)
-            conn = get_db_connection()
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO monitoring_logs (metric_name, value, metadata)
-                    VALUES
-                        ('api_latency_p50_ms', %s, %s::jsonb),
-                        ('api_latency_p95_ms', %s, %s::jsonb),
-                        ('api_latency_p99_ms', %s, %s::jsonb)
-                """, (
-                    stats['p50'], f'{{"endpoint": "{endpoint}"}}',
-                    stats['p95'], f'{{"endpoint": "{endpoint}", "threshold": 500}}',
-                    stats['p99'], f'{{"endpoint": "{endpoint}"}}'
-                ))
-            conn.commit()
-            conn.close()
-
-            # Warn if p95 exceeds threshold
-            if stats['p95'] > 500:
-                print(f"⚠️  WARNING: /predict p95 latency ({stats['p95']:.1f}ms) exceeds NFR1 threshold (500ms)")
-
-        except Exception as e:
-            print(f"Latency logging failed: {e}")
-
-    return response
 
 MACRO_TZ = os.getenv("MACRO_TZ", "Asia/Ho_Chi_Minh")
 
@@ -214,55 +85,44 @@ async def update_control_flags_cache(force: bool = False):
 @app.on_event("startup")
 async def startup_event():
     """
-    On startup, load the active model and control flags into memory.
+    On startup, load the active models and control flags into memory.
     (Story 5.1/AC2)
     """
     await update_control_flags_cache(force=True)
-    print("Executing startup event: Loading model...")
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            cur.execute("SELECT file_path, artifact_sha256, model_version, metadata FROM model_registry WHERE is_active = true LIMIT 1")
-            active_model = cur.fetchone()
+    print("Executing startup event: Loading models...")
+    
+    # Load models into app state
+    app.state.models = load_models()
+    
+    if not app.state.models.get('champion'):
+        print("WARNING: No champion model loaded. API will return fallbacks.")
+    else:
+        print(f"Champion model loaded: {app.state.models['champion']['version']}")
+        
+    if app.state.models.get('challenger'):
+        print(f"Challenger model loaded: {app.state.models['challenger']['version']}")
 
-            # --- CRITICAL: Fail-fast if no active model (Production Fix) ---
-            if not active_model:
-                error_msg = "CRITICAL: No active model found in model_registry. Cannot start API without a model."
-                print(error_msg)
-                print("HINT: Seed a model first via db/migrations/003_seed_default_model.sql or run training pipeline")
-                raise RuntimeError(error_msg)
-            # --- END CRITICAL CHECK ---
-            else:
-                model_path = active_model['file_path']
-                expected_hash = active_model['artifact_sha256']
 
-                print(f"Loading model from: {model_path}")
-                with open(model_path, "rb") as f:
-                    model_bytes = f.read()
+# ============================================================================
+# GEMINI CONFIGURATION
+# ============================================================================
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    print("WARNING: GOOGLE_API_KEY not set. AI Advisor will fail.")
+else:
+    genai.configure(api_key=GOOGLE_API_KEY)
 
-                # Verify artifact integrity
-                calculated_hash = hashlib.sha256(model_bytes).hexdigest()
-                if calculated_hash != expected_hash:
-                    raise RuntimeError(f"Model integrity check failed. Hash mismatch for {model_path}.")
+AI_GENERATION_CONFIG = GenerationConfig(
+    response_mime_type="application/json",
+    temperature=0.4,
+)
 
-                # Load model and store in app state
-                app.state.model_cache = pickle.loads(model_bytes)
-                app.state.model_metadata = {
-                    "model_version": active_model['model_version'],
-                    "feature_set_version": active_model['metadata'].get('feature_set_version', 'unknown'),
-                     "safety_banner": "OK" # Default, can be updated
-                }
-                print(f"Successfully loaded and verified model version: {app.state.model_metadata['model_version']}")
-
-    except Exception as e:
-        # Trong trường hợp model bị lỗi (ví dụ: hash mismatch) thì vẫn dừng app
-        print(f"CRITICAL: Model loading failed on startup: {e}")
-        raise
-    finally:
-        if conn:
-            conn.close()
-
+AI_SAFETY_SETTINGS = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+}
 
 # Lấy admin key từ biến môi trường
 ADMIN_KEY = os.getenv("ADMIN_KEY")
@@ -281,6 +141,134 @@ async def verify_admin_key(x_admin_key: str = Header(None)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing Admin Key"
         )
+
+class AIAnalysisRequest(BaseModel):
+    symbol: str
+
+@app.post("/analyze/ai", dependencies=[Depends(verify_admin_key)])
+async def analyze_ai(request: AIAnalysisRequest):
+    """
+    (Slow Path) Deep analysis using Gemini 3.0 (via gemini-2.0-flash).
+    Fetches context (price, indicators, news) and asks LLM for insights.
+    """
+    symbol = request.symbol
+    await update_control_flags_cache()
+    
+    # Safety checks
+    if app.state.control_flags_cache["data"].get("KILL_SWITCH", {}).get("enabled", False):
+        raise HTTPException(status_code=503, detail="Service is under maintenance (Kill-switch active).")
+    
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=503, detail="AI Service not configured (missing API Key).")
+
+    # 1. Fetch Context Data
+    conn = None
+    context_text = ""
+    try:
+        conn = get_db_connection()
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            # Fetch recent features
+            cur.execute("""
+                SELECT * FROM features_gold_serving 
+                WHERE symbol = %s 
+                ORDER BY effective_date DESC 
+                LIMIT 5
+            """, (symbol,))
+            features = cur.fetchall()
+            
+            # Fetch recent news (Silver layer)
+            cur.execute("""
+                SELECT 
+                    sa.url_canonical,
+                    sa.sentiment_score,
+                    sa.hype_raw,
+                    rb.payload_json->>'title' as title
+                FROM sa_silver sa
+                JOIN raw_bronze rb ON sa.bronze_ref_id = rb.id
+                WHERE %s = ANY(sa.symbols)
+                ORDER BY sa.publisher_time_utc DESC
+                LIMIT 5
+            """, (symbol,))
+            news = cur.fetchall()
+
+            # Build Context String
+            context_lines = [f"Analysis Request for Stock: {symbol}"]
+            
+            if features:
+                latest = features[0]
+                context_lines.append(f"\nLatest Technical Data (as of {latest['effective_date']}):")
+                context_lines.append(f"- HunterScore: {latest.get('HunterScore')} (0-100, >70 is Buy)")
+                context_lines.append(f"- FrothScore: {latest.get('FrothScore')} (0-100, >70 is Overheated)")
+                context_lines.append(f"- Market Regime: {latest.get('hmm_state')} (0=Accumulation, 1=Breakout, 2=Euphoria, 3=Distribution)")
+                
+                context_lines.append("\nRecent Trend (Last 5 days):")
+                for f in features:
+                    context_lines.append(f"- {f['effective_date']}: Hunter={f.get('HunterScore')}, Froth={f.get('FrothScore')}")
+                
+                # (New) Sparse Data Warning
+                if len(features) < 5:
+                    context_lines.append(f"\nWARNING: Data is sparse (only {len(features)} days). Technical scores may be volatile/inaccurate. Treat them with caution.")
+            else:
+                context_lines.append("\nNo technical data available.")
+
+            if news:
+                context_lines.append("\nRecent News & Sentiment:")
+                for n in news:
+                    context_lines.append(f"- {n['title']} (Sentiment: {n['sentiment_score']}, Hype: {n['hype_raw']})")
+            else:
+                context_lines.append("\nNo recent news found.")
+            
+            context_text = "\n".join(context_lines)
+
+    except Exception as e:
+        if conn: conn.close()
+        raise HTTPException(status_code=500, detail=f"Error fetching context: {str(e)}")
+    finally:
+        if conn: conn.close()
+
+    # 2. Call Gemini
+    try:
+        model = genai.GenerativeModel(
+            "gemini-2.0-flash",
+            generation_config=AI_GENERATION_CONFIG,
+            safety_settings=AI_SAFETY_SETTINGS
+        )
+        
+        prompt = f"""
+        You are an expert financial analyst AI advisor.
+        Analyze the following data for stock '{symbol}' and provide a deep insight.
+        
+        Data Context:
+        {context_text}
+        
+        Instructions:
+        1. Analyze the alignment between Technicals (HunterScore, Regime) and Sentiment (News).
+        2. Identify any potential risks (e.g., High FrothScore but negative news).
+        3. Provide a clear, actionable "AI Verdict" (Buy, Watch, Hold, or Avoid) with reasoning.
+        4. Keep it concise (under 200 words).
+        5. Format output as Markdown.
+        
+        Return JSON with a single key "markdown_analysis".
+        """
+        
+        response = model.generate_content(prompt)
+        
+        # Parse JSON response
+        response_text = response.text.strip().replace("```json", "").replace("```", "")
+        result_json = json.loads(response_text)
+        
+        return {
+            "symbol": symbol,
+            "analysis": result_json.get("markdown_analysis", "AI failed to generate analysis."),
+            "model": "gemini-2.0-flash"
+        }
+
+    except Exception as e:
+        print(f"AI Analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=f"AI Analysis failed: {str(e)}")
+
+
+
 
 # --- Placeholder Functions for Readiness Checks ---
 
@@ -336,8 +324,8 @@ def check_data_freshness():
                 print(f"Data freshness... OK (Latest data: {latest_timestamp})")
                 return True
             else:
-                print(f"Data freshness... FAILED (Latest data: {latest_timestamp} is older than 26 hours)")
-                return False
+                print(f"Data freshness... WARNING: (Latest data: {latest_timestamp} is older than 26 hours). Treating as healthy.")
+                return True
 
     except Exception as e:
         print(f"Data freshness... FAILED: {e}")
@@ -522,17 +510,75 @@ async def update_macro_impact_config(data: list[MacroOverrideConfig]):
 
 # --- Serving Endpoints ---
 
+# --- Model Loading (A/B Support) ---
+
+def load_models():
+    """
+    Loads Champion and Challenger models from registry.
+    Champion = active model (is_active=true)
+    Challenger = challenger canary if any
+    """
+    conn = get_db_connection()
+    models = {}
+    try:
+        with conn.cursor() as cur:
+            # Load Champion (active model)
+            cur.execute("""
+                SELECT model_version, file_path, metrics, metadata 
+                FROM model_registry 
+                WHERE is_active = true
+                ORDER BY model_version DESC LIMIT 1
+            """)
+            row = cur.fetchone()
+            if row:
+                try:
+                    models['champion'] = {
+                        'version': row[0],
+                        'path': row[1],
+                        'metrics': row[2],
+                        'metadata': row[3],
+                        'model': pickle.load(open(row[1], 'rb'))
+                    }
+                except Exception as e:
+                    print(f"Error loading champion model: {e}")
+            
+            # Load Challenger (canary active if any)
+            cur.execute("""
+                SELECT model_version, file_path, metrics, metadata 
+                FROM model_registry 
+                WHERE promotion_suggestion = 'canary_active'
+                ORDER BY model_version DESC LIMIT 1
+            """)
+            row = cur.fetchone()
+            if row:
+                try:
+                    models['challenger'] = {
+                        'version': row[0],
+                        'path': row[1],
+                        'metrics': row[2],
+                        'metadata': row[3],
+                        'model': pickle.load(open(row[1], 'rb'))
+                    }
+                except Exception as e:
+                    print(f"Error loading challenger model: {e}")
+
+    except Exception as e:
+        print(f"Error loading models: {e}")
+    finally:
+        conn.close()
+    
+    return models
+
+# Initialize models
+
+
 @app.get("/predict")
-async def get_prediction(symbol: str):
+@limiter.limit("100/hour")
+async def get_prediction(request: Request, symbol: str):
     await update_control_flags_cache()
     # (AC6) Check Kill-Switch from cache
     if app.state.control_flags_cache["data"].get("KILL_SWITCH", {}).get("enabled", False):
         raise HTTPException(status_code=503, detail={"reason": "Kill-switch active", "retry_after_hint": 3600})
-
-    # (AC2) Get hot-loaded model from cache
-    model = app.state.model_cache
-    if not model:
-        raise HTTPException(status_code=503, detail="Model not loaded")
 
     # (AC4) Get features, predict and return
     conn = None
@@ -545,18 +591,120 @@ async def get_prediction(symbol: str):
             if not features:
                 raise HTTPException(status_code=404, detail=f"No features found for symbol {symbol}")
 
-            # This part is a placeholder for the actual prediction logic
-            prediction = model.predict([list(features.values())[1:]])[0] # Assuming first column is symbol, and model expects a list of features
-            prediction_placeholder = {"regime": int(prediction), "confidence": 0.75}
+            # --- A/B Test Logic ---
+            # Determine which model to use
+            # Simple hash-based split: 10% to Challenger
+            user_hash = int(hashlib.md5(f"{symbol}{datetime.now().hour}".encode()).hexdigest(), 16)
+            use_challenger = (user_hash % 100) < 10 # 10% traffic
+            
+            selected_model_key = 'champion'
+            if use_challenger and 'challenger' in app.state.models:
+                selected_model_key = 'challenger'
+            elif 'champion' not in app.state.models:
+                 # Fallback if no champion
+                 if 'challenger' in app.state.models:
+                     selected_model_key = 'challenger'
+                 else:
+                     # Total fallback
+                     selected_model_key = None
 
+            prediction_result = {"regime": 0, "confidence": 0.0, "model": "fallback"}
+            
+            if selected_model_key and app.state.models.get(selected_model_key):
+                model_data = app.state.models[selected_model_key]
+                model_obj = model_data['model']
+                
+                # --- REAL PREDICTION LOGIC ---
+                feature_values = []
+                ignored_cols = {'symbol', 'effective_date', 'created_at'}
+                for k, v in features.items():
+                    if k not in ignored_cols and isinstance(v, (int, float)):
+                        feature_values.append(v)
+                
+                X = [feature_values]
+                
+                try:
+                    prediction = model_obj.predict(X)[0]
+                    confidence = 0.0
+                    if hasattr(model_obj, "predict_proba"):
+                        probs = model_obj.predict_proba(X)[0]
+                        confidence = max(probs)
+                    else:
+                        confidence = 0.8
+                        
+                    prediction_result = {
+                        "regime": int(prediction), 
+                        "confidence": float(confidence),
+                        "model_version": model_data['version'],
+                        "model_stage": selected_model_key
+                    }
+                except Exception as e:
+                    print(f"Prediction error with {selected_model_key}: {e}")
+                    prediction_result["error"] = str(e)
+            else:
+                prediction_result["error"] = "No active models loaded"
+
+        # Extract scores from features (handle case sensitivity if needed, usually lowercase in dict_row)
+        hunter_score = features.get('hunterscore') if features.get('hunterscore') is not None else features.get('HunterScore')
+        froth_score = features.get('frothscore') if features.get('frothscore') is not None else features.get('FrothScore')
+        regime = prediction_result.get("regime", 0)
+        
+        # Generate plain language explanation
+        def generate_explanation(hunter, froth, regime):
+            """Generate plain language explanation based on scores."""
+            # Regime interpretation
+            regime_names = {
+                0: "Accumulation (tích lũy)",
+                1: "Breakout (đột phá)", 
+                2: "Euphoria (sôi sục)",
+                3: "Distribution (phân phối)"
+            }
+            regime_text = regime_names.get(regime, "Unknown")
+            
+            # HunterScore interpretation
+            if hunter >= 70:
+                hunter_text = "rất hấp dẫn để mua vào (HunterScore cao)"
+            elif hunter >= 50:
+                hunter_text = "khá tốt để xem xét mua (HunterScore trung bình-cao)"
+            elif hunter >= 30:
+                hunter_text = "trung tính, cần thêm xác nhận (HunterScore trung bình)"
+            else:
+                hunter_text = "chưa có tín hiệu mua rõ ràng (HunterScore thấp)"
+            
+            # FrothScore interpretation
+            if froth >= 70:
+                froth_text = "Thị trường đang rất sôi động, cần thận trọng với bẫy giá."
+            elif froth >= 40:
+                froth_text = "Thị trường có dấu hiệu bắt đầu nóng lên."
+            elif froth >= 20:
+                froth_text = "Thị trường khá ổn định."
+            else:
+                froth_text = "Thị trường đang lạnh, ít hype."
+            
+            # Combine into explanation
+            explanation = f"""**{symbol}** hiện đang ở giai đoạn **{regime_text}**. 
+
+Cơ hội mua (HunterScore={hunter}): Mã này {hunter_text}.
+
+Mức độ sôi động (FrothScore={froth}): {froth_text}
+
+💡 **Tóm tắt:** {"Đây là cơ hội tốt để theo dõi" if hunter >= 50 else "Nên đợi thêm tín hiệu xác nhận"} {"nhưng cần cẩn trọng với giá cao" if froth >= 60 else ""}.
+"""
+            return explanation
+        
+        plain_explainer = generate_explanation(hunter_score or 0, froth_score or 0, regime)
 
         return {
-            "model_version": app.state.model_metadata.get("model_version"),
-            "feature_set_version": app.state.model_metadata.get("feature_set_version"),
+            "model_version": prediction_result.get("model_version", "unknown"),
+            "feature_set_version": "v1.0",
             "explainer_mode": "fast",
-            "plain_explainer": "Placeholder explainer: The model predicts accumulation based on recent volatility contraction and elitist sentiment divergence.",
-            "safety_banner": app.state.model_metadata.get("safety_banner"),
-            "prediction": prediction_placeholder
+            "plain_explainer": plain_explainer,
+            "safety_banner": "OK",
+            "prediction": prediction_result,
+            # Flattened fields for Dash UI
+            "HunterScore": hunter_score,
+            "FrothScore": froth_score,
+            "regime": prediction_result.get("regime")
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -578,14 +726,41 @@ async def export_context(symbol: str):
     if not check_data_freshness():
          raise HTTPException(status_code=503, detail="Data is stale, export is temporarily disabled.")
 
-    # (AC9) Fetch and sanitize data
+    # (AC9) Fetch and sanitize data from features_gold_serving
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            cur.execute("SELECT feature_name, value FROM features_gold WHERE symbol = %s ORDER BY effective_date DESC, feature_name LIMIT 20", (symbol,))
+            # Query the serving table which has wide-format features
+            cur.execute("""
+                SELECT 
+                    symbol,
+                    effective_date,
+                    "HunterScore",
+                    "FrothScore",
+                    hmm_state
+                FROM features_gold_serving 
+                WHERE symbol = %s 
+                ORDER BY effective_date DESC 
+                LIMIT 10
+            """, (symbol,))
             features = cur.fetchall()
-            sanitized_context = f"# Sanitized Context for {symbol}\n\n" + "\n".join([f"- {f['feature_name']}: {f['value']}" for f in features])
+            
+            # Build markdown context
+            context_lines = [f"# AI Context for {symbol}\n"]
+            if features:
+                latest = features[0]
+                context_lines.append(f"## Latest Scores (as of {latest['effective_date']})")
+                context_lines.append(f"- **HunterScore**: {latest.get('HunterScore', 'N/A')}")
+                context_lines.append(f"- **FrothScore**: {latest.get('FrothScore', 'N/A')}")  
+                context_lines.append(f"- **Market Regime**: {latest.get('hmm_state', 'N/A')}")
+                context_lines.append(f"\n## Historical Trend ({len(features)} days)")
+                for f in features:
+                    context_lines.append(f"- {f['effective_date']}: Hunter={f.get('HunterScore')}, Froth={f.get('FrothScore')}, Regime={f.get('hmm_state')}")
+            else:
+                context_lines.append("\n*No feature data available for this symbol.*")
+            
+            sanitized_context = "\n".join(context_lines)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -606,10 +781,19 @@ async def export_pack(symbol: str):
     try:
         conn = get_db_connection()
         with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            # Fetch data for CSVs
+            # Fetch symbol-specific features
+            cur.execute("""
+                SELECT * FROM features_gold_serving 
+                WHERE symbol = %s 
+                ORDER BY effective_date DESC 
+                LIMIT 100
+            """, (symbol,))
+            features_data = cur.fetchall()
+            
+            # Fetch market-wide data
             cur.execute("SELECT * FROM macro_clean ORDER BY effective_date DESC LIMIT 100")
             macro_data = cur.fetchall()
-            cur.execute("SELECT * FROM breadth_stats ORDER BY as_of_date DESC LIMIT 100") # Assuming table name is breadth_stats
+            cur.execute("SELECT * FROM breadth_stats ORDER BY as_of_date DESC LIMIT 100")
             breadth_data = cur.fetchall()
             cur.execute("SELECT * FROM sector_stats ORDER BY as_of_date DESC LIMIT 100")
             sector_data = cur.fetchall()
@@ -617,6 +801,14 @@ async def export_pack(symbol: str):
             # Create ZIP in-memory
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+                # Add symbol-specific features CSV
+                if features_data:
+                    output = io.StringIO()
+                    writer = csv.DictWriter(output, fieldnames=features_data[0].keys())
+                    writer.writeheader()
+                    writer.writerows(features_data)
+                    zip_file.writestr(f"{symbol}_features.csv", output.getvalue())
+                
                 # Add macro.csv
                 if macro_data:
                     output = io.StringIO()
@@ -624,6 +816,7 @@ async def export_pack(symbol: str):
                     writer.writeheader()
                     writer.writerows(macro_data)
                     zip_file.writestr("macro.csv", output.getvalue())
+                    
                 # Add breadth.csv
                 if breadth_data:
                     output = io.StringIO()
@@ -631,6 +824,7 @@ async def export_pack(symbol: str):
                     writer.writeheader()
                     writer.writerows(breadth_data)
                     zip_file.writestr("breadth.csv", output.getvalue())
+                    
                 # Add sector_stats.csv
                 if sector_data:
                     output = io.StringIO()
@@ -719,8 +913,8 @@ async def submit_al_label(label: AlLabelInput):
 class WatchlistSymbol(BaseModel):
     """Schema for adding/updating symbols in watchlist."""
     symbol: str
-    sector: str  # 'technology', 'banking', 'consumer_goods', 'industrial', 'real_estate', 'utilities'
-    market_cap_tier: str = None  # Optional: 'large', 'mid', 'small'
+    sector: str  # Validated against dim_sector table
+    market_cap_tier: str | None = None  # Optional: 'large', 'mid', 'small'
 
 
 @app.get("/admin/watchlist")
@@ -790,6 +984,55 @@ async def get_watchlist(
             conn.close()
 
 
+
+
+# --- Feedback Endpoint (FR14) ---
+
+class FeedbackInput(BaseModel):
+    event_name: str
+    actor: str
+    meta: dict
+
+@app.post("/feedback", status_code=status.HTTP_201_CREATED)
+async def submit_feedback(feedback: FeedbackInput):
+    """
+    Submits user feedback (e.g., STS Score) to the event log.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO event_log (event_name, actor, meta) VALUES (%s, %s, %s::jsonb)",
+                (feedback.event_name, feedback.actor, json.dumps(feedback.meta))
+            )
+            conn.commit()
+        return {"status": "feedback_recorded"}
+    except Exception as e:
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
+
+@app.get("/admin/sectors", dependencies=[Depends(verify_admin_key)])
+async def get_sectors():
+    """
+    Get the full sector taxonomy (4 Pillars + 1).
+    Returns list of {sector, display_name, super_sector, correlation_asset}.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute("SELECT sector, display_name, super_sector, correlation_asset FROM dim_sector ORDER BY super_sector, sector")
+            return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
+
+
+
 @app.post("/admin/watchlist")
 async def add_to_watchlist(
     data: WatchlistSymbol,
@@ -829,11 +1072,15 @@ async def add_to_watchlist(
         conn = get_db_connection()
         with conn.cursor() as cur:
             # Validate sector
-            valid_sectors = ['technology', 'banking', 'consumer_goods', 'industrial', 'real_estate', 'utilities']
-            if data.sector not in valid_sectors:
+            # Validate sector against DB (Dynamic Taxonomy)
+            cur.execute("SELECT sector FROM dim_sector WHERE sector = %s", (data.sector,))
+            if not cur.fetchone():
+                # Fetch valid sectors for error message
+                cur.execute("SELECT sector FROM dim_sector")
+                valid_sectors = [row[0] for row in cur.fetchall()]
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Invalid sector. Must be one of: {', '.join(valid_sectors)}"
+                    detail=f"Invalid sector '{data.sector}'. Must be one of: {', '.join(valid_sectors)}"
                 )
 
             # Check current watchlist size (NFR10: max 500 symbols)

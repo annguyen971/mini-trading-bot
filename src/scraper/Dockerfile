@@ -12,7 +12,7 @@ COPY . .
 RUN pip install ./core_lib
 
 # 2. Cài đặt các thư viện public của 'scraper' (từ pyproject.toml)
-RUN pip install httpx beautifulsoup4
+RUN pip install httpx beautifulsoup4 psycopg2-binary pandas vnstock
 
 # 3. Cài đặt 'scraper' mà KHÔNG KIỂM TRA dependency
 RUN pip install --no-deps ./scraper

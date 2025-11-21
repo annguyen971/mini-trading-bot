@@ -109,6 +109,17 @@ CREATE TABLE IF NOT EXISTS features_gold (
 ) PARTITION BY RANGE (effective_date);
 CREATE TABLE IF NOT EXISTS features_gold_default PARTITION OF features_gold DEFAULT;
 
+-- Bảng Serving (dạng rộng, được hoán đổi nguyên tử)
+CREATE TABLE IF NOT EXISTS features_gold_serving (
+    symbol TEXT,
+    effective_date DATE,
+    hmm_state INT,
+    HunterScore REAL,
+    FrothScore REAL,
+    -- ... các features khác ...
+    PRIMARY KEY (symbol, effective_date)
+);
+
 -- ==== ML & NHÃN (ELITIST) ====
 CREATE TABLE IF NOT EXISTS dim_source (
   source_id TEXT PRIMARY KEY,

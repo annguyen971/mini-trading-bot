@@ -469,7 +469,7 @@ def auto_suggest_promotion(conn, new_model_version: str, new_metrics: Dict) -> s
 
     if sharpe_improvement < MIN_SHARPE_IMPROVEMENT:
         reason = f"Sharpe improvement {sharpe_improvement:.3f} < {MIN_SHARPE_IMPROVEMENT}"
-        print(f"\n   Auto-Suggest: REJECTED - {reason}")
+        print(f"\n  Auto-Suggest: REJECTED - {reason}")
         return 'rejected'
 
     # Guardrail 2: Max drawdown degradation (AC2)
@@ -479,7 +479,7 @@ def auto_suggest_promotion(conn, new_model_version: str, new_metrics: Dict) -> s
 
     if dd_degradation > MAX_DRAWDOWN_DEGRADATION:
         reason = f"Drawdown degradation {dd_degradation:.2%} > {MAX_DRAWDOWN_DEGRADATION:.2%}"
-        print(f"\n   Auto-Suggest: REJECTED - {reason}")
+        print(f"\n  Auto-Suggest: REJECTED - {reason}")
         return 'rejected'
 
     # All guardrails passed

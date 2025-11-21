@@ -1,0 +1,30 @@
+# Stock Hunter AI - Master Crontab
+# Running in 'cron' container, executing commands via docker exec
+
+# (Story 2.1/AC1) NLP Cascade Batch (Daily 01:00 UTC)
+0 1 * * * docker exec mini-trading-bot-worker-1 python -m worker.tasks_nlp >> /var/log/cron.log 2>&1
+
+# (Story 2.2/AC1) Elitist Signal Batch (Daily 02:00 UTC)
+0 2 * * * docker exec mini-trading-bot-worker-1 python -m worker.tasks_elitist >> /var/log/cron.log 2>&1
+
+# Feature Gold Batch (Daily 02:30 UTC)
+30 2 * * * docker exec mini-trading-bot-worker-1 python -m worker.tasks_feature_gold >> /var/log/cron.log 2>&1
+
+# Label Batch (Daily 02:40 UTC)
+40 2 * * * docker exec mini-trading-bot-worker-1 python -m worker.tasks_label >> /var/log/cron.log 2>&1
+
+# (Story 4.1/AC1) Train Check Batch (Daily 02:50 UTC)
+50 2 * * * docker exec mini-trading-bot-worker-1 python -m worker.tasks_train >> /var/log/cron.log 2>&1
+
+# (Story 4.2/AC1) WFO Backtest (Weekly Sunday 03:00 UTC)
+# Running in main worker to avoid docker compose complexity
+0 3 * * 0 docker exec mini-trading-bot-worker-1 python -m worker.tasks_backtest >> /var/log/cron.log 2>&1
+
+# Macro Batch (Monthly 1st 03:00 UTC)
+0 3 1 * * docker exec mini-trading-bot-scraper-1 python -m scraper.main --task macro_batch >> /var/log/cron.log 2>&1
+
+# (Story 4.3/AC6) Monitor Canary (Hourly)
+0 * * * * docker exec mini-trading-bot-worker-1 python -m worker.tasks_monitor >> /var/log/cron.log 2>&1
+
+# NFR6: Retention Cleanup (Weekly Sunday 03:00 UTC)
+0 3 * * 0 /etc/periodic/custom/retention_cleanup >> /var/log/cron.log 2>&1

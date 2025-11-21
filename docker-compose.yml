@@ -4,13 +4,13 @@ services:
     image: caddy:2-alpine
     env_file: .env
     restart: always
-    ports: ["80:80","443:443"]
+    ports: [ "80:80", "443:443" ]
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
     logging:
       driver: "json-file"
-      options: {max-size: "100m", max-file: "5"}
+      options: { max-size: "100m", max-file: "5" }
     deploy: { resources: { limits: { cpus: '0.2', memory: 128M } } }
 
   # 2. DATABASE
@@ -32,13 +32,13 @@ services:
       - ./db/tests:/docker-entrypoint-initdb.d/tests:ro
       - ./backups:/backups
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U hunter -d hunter"]
+      test: [ "CMD-SHELL", "pg_isready -U hunter -d hunter" ]
       interval: 10s
       timeout: 3s
       retries: 10
     logging:
       driver: "json-file"
-      options: {max-size: "100m", max-file: "5"}
+      options: { max-size: "100m", max-file: "5" }
     deploy: { resources: { limits: { cpus: '0.5', memory: 512M } } }
 
   # 3. API (BIND NỘI BỘ)
@@ -56,16 +56,16 @@ services:
     depends_on:
       db: { condition: service_healthy }
     volumes:
-      - artifacts:/opt/artifacts:ro     # Đọc .pkl
-      - packs:/opt/packs               # Viết/Đọc .zip cache
+      - artifacts:/opt/artifacts:ro # Đọc .pkl
+      - packs:/opt/packs # Viết/Đọc .zip cache
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/readyz || exit 1"]
+      test: [ "CMD-SHELL", "curl -f http://127.0.0.1:8000/readyz || exit 1" ]
       interval: 15s
       timeout: 3s
       retries: 8
     logging:
       driver: "json-file"
-      options: {max-size: "100m", max-file: "5"}
+      options: { max-size: "100m", max-file: "5" }
     restart: always
     deploy: { resources: { limits: { cpus: '0.35', memory: 320M } } }
 
@@ -74,7 +74,7 @@ services:
     build:
       context: ./src
       dockerfile: worker/Dockerfile
-    command: ["python", "-m", "worker.main"] # Chạy chờ hoặc chạy tác vụ dài
+    command: [ "python", "-m", "worker.main" ] # Chạy chờ hoặc chạy tác vụ dài
     env_file: .env
     environment:
       - DB_URL=${DB_URL}
@@ -83,11 +83,12 @@ services:
     depends_on:
       db: { condition: service_healthy }
     volumes:
-      - artifacts:/opt/artifacts        # Viết .pkl
-      - packs:/opt/packs                # Viết/Đọc .zip cache
+      - artifacts:/opt/artifacts # Viết .pkl
+      - packs:/opt/packs # Viết/Đọc .zip cache
+      - ./src/worker/worker:/app/worker # Dev mount
     logging:
       driver: "json-file"
-      options: {max-size: "100m", max-file: "5"}
+      options: { max-size: "100m", max-file: "5" }
     deploy: { resources: { limits: { cpus: '0.8', memory: 1.2G } } }
     restart: on-failure
 
@@ -96,8 +97,8 @@ services:
     build:
       context: ./src
       dockerfile: worker/Dockerfile
-    command: ["python", "-m", "worker.tasks_train", "--profile", "backtest"]
-    profiles: ["backtest"]
+    command: [ "python", "-m", "worker.tasks_train", "--profile", "backtest" ]
+    profiles: [ "backtest" ]
     env_file: .env
     environment:
       - DB_URL=${DB_URL}
@@ -109,14 +110,14 @@ services:
     deploy: { resources: { limits: { cpus: '1.2', memory: 1.5G } } }
     logging:
       driver: "json-file"
-      options: {max-size: "100m", max-file: "5"}
+      options: { max-size: "100m", max-file: "5" }
 
   # 6. SCRAPER (LUÔN CHẠY)
   scraper:
     build:
       context: ./src
       dockerfile: scraper/Dockerfile
-    command: ["python", "-m", "scraper.main"]
+    command: [ "python", "-m", "scraper.main" ]
     env_file: .env
     environment:
       - DB_URL=${DB_URL}
@@ -124,7 +125,7 @@ services:
       db: { condition: service_healthy }
     logging:
       driver: "json-file"
-      options: {max-size: "100m", max-file: "5"}
+      options: { max-size: "100m", max-file: "5" }
     deploy: { resources: { limits: { cpus: '0.3', memory: 256M } } }
     restart: always
 
@@ -147,14 +148,14 @@ services:
       api: { condition: service_healthy }
     logging:
       driver: "json-file"
-      options: {max-size: "100m", max-file: "5"}
+      options: { max-size: "100m", max-file: "5" }
     deploy: { resources: { limits: { cpus: '0.25', memory: 256M } } }
     restart: always
 
   # 8. CRON (SIDECAR)
   cron:
     build: ./src/cron
-    profiles: ["cron"]
+    profiles: [ "cron" ]
     volumes:
       - ./scripts/cron:/etc/periodic/custom:ro
       - /var/run/docker.sock:/var/run/docker.sock # Để chạy docker exec

@@ -3,10 +3,9 @@ from datetime import datetime, timedelta
 from typing import List
 import logging
 
-# Updated to use 'vnstock' library
-from vnstock import Vnstock
+# Import vnstock classes theo documentation chính thống
+from vnstock import Quote
 
-# FIX: Corrected the import path to remove the extra 'core_lib'
 from core_lib.data_source import PriceSource, NewsSource
 
 # Set up logging
@@ -16,82 +15,107 @@ logger = logging.getLogger(__name__)
 class VnStockSource(PriceSource, NewsSource):
     """
     An implementation of PriceSource and NewsSource using the vnstock library.
-    This version propagates exceptions and uses safe data mapping.
+    Refactored to use direct functional calls (vnstock standard).
     """
     def __init__(self):
-        self.stock = Vnstock()
+        # Initialize with VCI as default source (reliable)
+        self.source = 'VCI'
 
     def get_ohlcv(self, symbol: str, start_date: str, end_date: str) -> List[dict]:
         """
         Fetches historical OHLCV data using vnstock.
-        Maps the vnstock DataFrame to the required internal format.
-        Raises exceptions on failure.
         """
         try:
             logger.info(f"Fetching OHLCV for {symbol} from {start_date} to {end_date}")
-            df = self.stock.stock.historical_data(
-                symbol=symbol,
-                start_date=start_date,
-                end_date=end_date
-            )
+            
+            # Use Quote class per vnstock documentation
+            quote = Quote(symbol=symbol, source=self.source)
+            df = quote.history(start=start_date, end=end_date, interval='1D')
 
             if df is None or df.empty:
                 logger.warning(f"No OHLCV data returned for {symbol}")
                 return []
 
+            # Chuẩn hóa tên cột cho khớp với hệ thống của bạn
+            # vnstock trả về: time, open, high, low, close, volume
+            # TAData expects: symbol, trade_date, open, high, low, close, volume (int), value/turnover (float)
             df_renamed = df.rename(columns={
-                'time': 'trade_date',
-                'value': 'turnover'
+                'time': 'trade_date'
             })
 
             df_renamed['symbol'] = symbol
+            # Đảm bảo trade_date là object date
             df_renamed['trade_date'] = pd.to_datetime(df_renamed['trade_date']).dt.date
+            
+            # Add 'value' field (turnover) - keep volume and add value
+            # value/turnover is typically volume * close (as approximation)
+            if 'volume' not in df_renamed.columns:
+                logger.warning(f"'volume' column missing from vnstock data for {symbol}")
+                df_renamed['volume'] = 0
+            
+            # Calculate turnover value (volume * close)
+            df_renamed['value'] = df_renamed['volume'] * df_renamed['close']
+            
+            # Ensure volume is int
+            df_renamed['volume'] = df_renamed['volume'].astype(int)
 
+            # Convert sang list dict
             return df_renamed.to_dict('records')
 
         except Exception as e:
             logger.error(f"vnstock failed to fetch OHLCV for {symbol}: {e}")
+            # Return list rỗng để không crash worker, hoặc raise nếu muốn retry
+            # Ở đây raise để worker biết là lỗi
             raise
 
     def fetch_latest_news(self, symbol: str, days: int) -> List[dict]:
         """
-        Fetches the latest news for a symbol using vnstock.
-        Uses safe .get() access for mapping to prevent KeyErrors.
-        Raises exceptions on failure.
+        Fetches the latest news for a symbol using vnstock company news.
         """
         try:
-            logger.info(f"Fetching latest news for {symbol} for the last {days} days")
-            news_list = self.stock.stock.news(symbol=symbol, page_size=30, page_num=1)
-
-            if not news_list:
+            logger.info(f"Fetching latest news for {symbol}")
+            
+            # Use vnstock Company class to get news
+            from vnstock import Company
+            
+            company = Company(symbol=symbol, source='TCBS')
+            
+            # Fetch news - vnstock returns DataFrame
+            news_df = company.news(page_size=20)  # Get last 20 articles
+            
+            if news_df is None or news_df.empty:
                 logger.warning(f"No news data returned for {symbol}")
                 return []
-
-            processed_news = []
-            cutoff_date = datetime.now() - timedelta(days=days)
-
-            for article in news_list:
-                published_at_str = article.get('published_at')
-                if not published_at_str:
-                    continue
-
-                published_at = pd.to_datetime(published_at_str)
-                if published_at < cutoff_date:
-                    continue
-
-                processed_article = {
-                    'id': article.get('id', article.get('url', '')),
-                    'url': article.get('url', ''),
-                    'title': article.get('title', ''),
-                    'source': article.get('source', 'vnstock'),
-                    'text': article.get('description', ''),
-                    'published_at': published_at,
-                    'first_seen_time': datetime.now()
+            
+            # Calculate date threshold
+            threshold_date = datetime.now() - timedelta(days=days)
+            
+            # Filter by publish date if available
+            if 'publishDate' in news_df.columns:
+                news_df['publishDate'] = pd.to_datetime(news_df['publishDate'])
+                news_df = news_df[news_df['publishDate'] >= threshold_date]
+            
+            # Convert to list of dicts with standardized schema
+            news_list = []
+            for _, row in news_df.iterrows():
+                article = {
+                    'id': str(row.get('id', row.get('newsID', ''))),
+                    'source': row.get('source', 'TCBS'),
+                    'url': row.get('link', row.get('href', '')),
+                    'title': row.get('title', ''),
+                    'text': row.get('content', row.get('description', '')),
+                    'published_at': row.get('publishDate', datetime.now()).isoformat() if pd.notna(row.get('publishDate')) else datetime.now().isoformat(),
+                    'first_seen_time': datetime.now().isoformat(),
                 }
-                processed_news.append(processed_article)
+                news_list.append(article)
+            
+            logger.info(f"Successfully fetched {len(news_list)} news articles for {symbol}")
+            return news_list
 
-            return processed_news
-
+        except ImportError:
+            logger.error("vnstock Company class not available. Install vnstock3>=3.0.0")
+            return []
         except Exception as e:
             logger.error(f"vnstock failed to fetch news for {symbol}: {e}")
-            raise
+            # News errors can be skipped, return empty
+            return []

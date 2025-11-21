@@ -160,7 +160,15 @@ def apply_sa_sanity_rules(payload: dict) -> Tuple[bool, Optional[str], Optional[
     # Rule 1: URL validation
     url = payload.get('url_canonical', '') or payload.get('url', '')
     if not url or not URL_PATTERN.match(url):
-        return False, 'sa_rule_1_url_invalid', f'Invalid or missing URL: {url}'
+        # Auto-fix for TCBS: generate synthetic URL from ID
+        source_name = payload.get('source_domain') or payload.get('source_name') or 'unknown'
+        article_id = payload.get('id')
+        if source_name == 'TCBS' and article_id:
+            url = f"https://tcinvest.tcbs.com.vn/news/{article_id}"
+            payload['url_canonical'] = url
+            print(f"WARN: Generated synthetic URL for TCBS: {url}")
+        else:
+            return False, 'sa_rule_1_url_invalid', f'Invalid or missing URL: {url}'
 
     # Rule 2: Timestamp validation (not NULL, not > now + 5 min)
     publisher_time_str = payload.get('publisher_time_utc') or payload.get('publisher_time')
@@ -358,6 +366,29 @@ def mark_done(conn, task_id: int):
     with conn.cursor() as cursor:
         cursor.execute("DELETE FROM task_q WHERE id = %s", (task_id,))
 
+# --- Bronze Data Fetching ---
+
+def fetch_bronze_data(conn, bronze_id: str) -> Optional[dict]:
+    """
+    Fetches the payload_json from raw_bronze for a given bronze_id.
+    Returns None if not found.
+    Adds bronze_ref_id to the payload for tracking.
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT payload_json, id FROM raw_bronze WHERE id = %s",
+            (bronze_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        
+        payload_json, uuid = row
+        # Add bronze_ref_id for tracking
+        if isinstance(payload_json, dict):
+            payload_json['bronze_ref_id'] = str(uuid)
+        return payload_json
+
 # --- Backpressure Control (AC7) ---
 
 def check_and_set_backpressure(conn, threshold: int = BACKPRESSURE_THRESHOLD):
@@ -415,30 +446,58 @@ def process_batch(conn, batch_size: int = BATCH_SIZE):
 
             # Route by task kind
             if kind == 'TA_PROCESS':
-                # Apply TA sanity rules
-                passed, rule_id, error_msg = apply_ta_sanity_rules(payload)
+                # Extract bronze_id from task payload
+                bronze_id = payload.get('bronze_id')
+                if not bronze_id:
+                    move_to_dlq(conn, task_id, payload, 'missing_bronze_id', None, 'Task missing bronze_id')
+                    dlq_count += 1
+                    continue
+                
+                # Fetch actual data from raw_bronze
+                bronze_data = fetch_bronze_data(conn, bronze_id)
+                if not bronze_data:
+                    move_to_dlq(conn, task_id, payload, 'bronze_not_found', None, f'Bronze ID {bronze_id} not found')
+                    dlq_count += 1
+                    continue
+                
+                # Apply TA sanity rules on bronze data
+                passed, rule_id, error_msg = apply_ta_sanity_rules(bronze_data)
 
                 if not passed:
-                    move_to_dlq(conn, task_id, payload, 'sanity_fail', rule_id, error_msg)
+                    move_to_dlq(conn, task_id, bronze_data, 'sanity_fail', rule_id, error_msg)
                     dlq_count += 1
                     continue
 
                 # UPSERT to ta_silver
-                upsert_ta_silver(conn, payload)
+                upsert_ta_silver(conn, bronze_data)
                 mark_done(conn, task_id)
                 success_count += 1
 
             elif kind == 'NLP_PROCESS':
-                # Apply SA sanity rules
-                passed, rule_id, error_msg = apply_sa_sanity_rules(payload)
+                # Extract bronze_id from task payload
+                bronze_id = payload.get('bronze_id')
+                if not bronze_id:
+                    move_to_dlq(conn, task_id, payload, 'missing_bronze_id', None, 'Task missing bronze_id')
+                    dlq_count += 1
+                    continue
+                
+                # Fetch actual data from raw_bronze
+                bronze_data = fetch_bronze_data(conn, bronze_id)
+                if not bronze_data:
+                    move_to_dlq(conn, task_id, payload, 'bronze_not_found', None, f'Bronze ID {bronze_id} not found')
+                    dlq_count += 1
+                    continue
+                
+                # Apply SA sanity rules on bronze data
+                passed, rule_id, error_msg = apply_sa_sanity_rules(bronze_data)
 
                 if not passed:
-                    move_to_dlq(conn, task_id, payload, 'sanity_fail', rule_id, error_msg)
+                    move_to_dlq(conn, task_id, bronze_data, 'sanity_fail', rule_id, error_msg)
                     dlq_count += 1
                     continue
 
                 # UPSERT to sa_silver
-                upsert_sa_silver(conn, payload)
+                upsert_sa_silver(conn, bronze_data)
                 mark_done(conn, task_id)
                 success_count += 1
 
@@ -497,6 +556,11 @@ def main():
             return 0
 
         print(f"✓ Acquired lock '{ADVISORY_LOCK_NAME}'")
+        
+        # CRITICAL FIX: Commit after lock to end initial transaction
+        # Psycopg3 uses REPEATABLE READ - worker can't see tasks inserted after connection
+        # Committing here ensures each fetch_batch() runs in fresh transaction
+        conn.commit()
 
         # Process batches until no more work
         batch_count = 0

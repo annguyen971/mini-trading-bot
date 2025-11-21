@@ -57,6 +57,20 @@ def fetch_watchlist_stats():
         return None
 
 
+
+@st.cache_data(ttl=3600)  # Cache for 1 hour (taxonomy rarely changes)
+def fetch_sectors():
+    """Fetch sector taxonomy from API."""
+    try:
+        url = f"{API_BASE_URL}/admin/sectors"
+        response = httpx.get(url, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        st.error(f"Error fetching sectors: {e}")
+        return []
+
+
 def add_symbol(symbol: str, sector: str, market_cap_tier: str = None):
     """Add symbol to watchlist."""
     try:
@@ -177,11 +191,40 @@ with st.form("add_symbol_form"):
         )
 
     with col2:
-        sector = st.selectbox(
+        # Fetch sectors dynamically
+        sectors_data = fetch_sectors()
+        
+        # Group by Super Sector
+        sector_options = {}
+        if sectors_data:
+            for item in sectors_data:
+                super_sec = item['super_sector'] or "Other"
+                if super_sec not in sector_options:
+                    sector_options[super_sec] = []
+                sector_options[super_sec].append((item['sector'], item['display_name']))
+        
+        # Create selectbox options with formatting
+        flat_options = []
+        option_map = {} # label -> sector_code
+        
+        # Custom order for 4 Pillars
+        pillar_order = ["Financials", "Real_Estate_Chain", "Production_Export", "Consumer_Tech", "Utilities"]
+        
+        sorted_super_sectors = sorted(sector_options.keys(), key=lambda x: pillar_order.index(x) if x in pillar_order else 99)
+        
+        for super_sec in sorted_super_sectors:
+            for sec_code, sec_name in sector_options[super_sec]:
+                label = f"{super_sec}: {sec_name} ({sec_code})"
+                flat_options.append(label)
+                option_map[label] = sec_code
+                
+        selected_label = st.selectbox(
             "Sector",
-            ["technology", "banking", "consumer_goods", "industrial", "real_estate", "utilities"],
-            help="Industry sector classification"
+            options=flat_options,
+            help="Select sector (grouped by 4 Pillars)"
         )
+        
+        sector = option_map.get(selected_label) if selected_label else None
 
     with col3:
         market_cap_tier = st.selectbox(
@@ -323,13 +366,14 @@ with st.expander("ℹ️ Help & Guidelines"):
     - **Deactivate** (default): Symbol remains in database but won't be scraped
     - **Permanent delete**: Symbol completely removed from database
 
-    ### Sector Classifications
-    - **Technology**: Software, IT services, electronics
-    - **Banking**: Banks, financial institutions
-    - **Consumer Goods**: Food, beverages, retail
-    - **Industrial**: Manufacturing, construction materials
-    - **Real Estate**: Property development, REITs
-    - **Utilities**: Energy, water, telecommunications
+    ### Sector Classifications (4 Pillars + 1)
+    The system now uses the "4 Pillars + 1" taxonomy tailored for Vietnam:
+    1. **Financials & Capital**: Banking, Securities, Insurance
+    2. **Real Estate & Value Chain**: Real Estate, Industrial RE, Construction, Materials
+    3. **Production & Export**: Energy, Agriculture, Manufacturing, Chemicals, Logistics
+    4. **Consumer & Tech**: Retail, Technology, F&B
+    5. **Utilities**: Power, Water, Pharma
+
 
     ### NFR10 Compliance
     The system enforces a **maximum of 500 active symbols** to ensure:

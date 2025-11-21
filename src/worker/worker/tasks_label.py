@@ -458,6 +458,73 @@ def generate_al_queue(conn, labels_data: List[Dict]):
 
     print(f"Added {len(selected)} samples to AL queue")
 
+# --- Honeypot Injection (AC9) ---
+
+def inject_honeypots(labels_data: List[Dict], honeypot_rate: float = 0.05) -> List[Dict]:
+    """
+    Injects honeypot samples with known ground truth for quality assurance.
+    
+    Honeypots help detect:
+    - Low-quality LFs (systematically wrong on known samples)
+    - Drift in LF performance over time
+    - Labeler quality in Active Learning
+    
+    Strategy:
+    - Select samples with extreme signals (clear correct labels)
+    - Mark as honeypots for monitoring
+    - Track LF accuracy on these samples
+    
+    Args:
+        labels_data: List of label predictions
+        honeypot_rate: Fraction of samples to mark as honeypots (default 5%)
+    
+    Returns:
+        labels_data with is_honeypot flags added
+    """
+    if len(labels_data) == 0:
+        return labels_data
+    
+    # Identify clear BUY signals (honeypot candidates)
+    buy_honeypot_candidates = [
+        label for label in labels_data
+        if (label.get('hunter_score') is not None and
+            label.get('froth_score') is not None and
+            label['hunter_score'] >= 85 and 
+            label['froth_score'] <= 15 and
+            label['state_snorkel'] == LABEL_BUY)
+    ]
+    
+    # Identify clear NO_BUY signals
+    no_buy_honeypot_candidates = [
+        label for label in labels_data
+        if (label.get('froth_score') is not None and
+            label.get('hunter_score') is not None and
+            (label['froth_score'] >= 85 or label['hunter_score'] <= 15) and
+            label['state_snorkel'] == LABEL_NO_BUY)
+    ]
+    
+    # Select honeypots (balanced)
+    target_count = max(1, int(len(labels_data) * honeypot_rate))
+    buy_count = min(len(buy_honeypot_candidates), target_count // 2)
+    no_buy_count = min(len(no_buy_honeypot_candidates), target_count - buy_count)
+    
+    honeypots = (
+        sorted(buy_honeypot_candidates, key=lambda x: x.get('hunter_score', 0), reverse=True)[:buy_count] +
+        sorted(no_buy_honeypot_candidates, key=lambda x: x.get('froth_score', 0), reverse=True)[:no_buy_count]
+    )
+    
+    # Mark honeypots
+    honeypot_symbols = {(h['symbol'], h['effective_date']) for h in honeypots}
+    
+    for label in labels_data:
+        label['is_honeypot'] = (label['symbol'], label['effective_date']) in honeypot_symbols
+    
+    print(f"  - Honeypots injected: {len(honeypots)} ({len(honeypots)/len(labels_data)*100:.1f}%)")
+    print(f"    - BUY honeypots: {buy_count}")
+    print(f"    - NO_BUY honeypots: {no_buy_count}")
+    
+    return labels_data
+
 # --- Main Label Batch ---
 
 def run_label_batch():
@@ -562,6 +629,10 @@ def run_label_batch():
         print(f" Generated {len(labels_data)} labels")
         print(f"  - Auto-accepted (confidence >= {AUTO_ACCEPT_CONFIDENCE}): {auto_accept_count}")
         print(f"  - Needs review: {len(labels_data) - auto_accept_count}")
+        
+        # Step 5.5: Inject honeypots (AC9)
+        print("\nInjecting honeypots for quality assurance...")
+        labels_data = inject_honeypots(labels_data)
 
         # Step 6: Write to labels_silver (AC4)
         print("\nWriting to labels_silver...")
@@ -573,9 +644,9 @@ def run_label_batch():
                 cursor.execute("""
                     INSERT INTO labels_silver (
                         symbol, effective_date, state_hmm, state_snorkel,
-                        probability, entropy, source, is_golden
+                        probability, entropy, source, is_golden, is_honeypot
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s::jsonb, %s
+                        %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s
                     )
                     ON CONFLICT (symbol, effective_date)
                     DO UPDATE SET
@@ -583,7 +654,8 @@ def run_label_batch():
                         probability = EXCLUDED.probability,
                         entropy = EXCLUDED.entropy,
                         source = EXCLUDED.source,
-                        is_golden = EXCLUDED.is_golden
+                        is_golden = EXCLUDED.is_golden,
+                        is_honeypot = EXCLUDED.is_honeypot
                 """, (
                     label_data['symbol'],
                     label_data['effective_date'],
@@ -592,7 +664,8 @@ def run_label_batch():
                     label_data['probability'],
                     label_data['entropy'],
                     json.dumps({'lf_votes': lf_votes, 'lf_fingerprint': lf_fingerprint}),
-                    label_data['is_golden']
+                    label_data['is_golden'],
+                    label_data.get('is_honeypot', False)
                 ))
 
         conn.commit()

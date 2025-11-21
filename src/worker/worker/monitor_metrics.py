@@ -121,23 +121,49 @@ def collect_model_performance_metrics(conn) -> Dict:
             ORDER BY created_at DESC
             LIMIT 1
         """)
-        active_model = cursor.fetchone()
-
-        if active_model:
-            import json
-            model_metrics = json.loads(active_model[1])
-
-            metrics['active_model_version'] = active_model[0]
-            metrics['model_sharpe'] = model_metrics.get('sharpe', 0.0)
-            metrics['model_ic'] = model_metrics.get('ic', 0.0)
-            metrics['model_max_drawdown'] = model_metrics.get('max_drawdown', 0.0)
-            metrics['model_age_days'] = (datetime.now() - active_model[2]).days
+        row = cursor.fetchone()
+        if row:
+            metrics['active_model_version'] = row[0]
+            model_metrics = row[1] # JSONB
+            metrics['model_age_days'] = (datetime.now() - row[2].replace(tzinfo=None)).days
+            
+            # Extract training metrics
+            if isinstance(model_metrics, dict):
+                metrics['train_ic'] = model_metrics.get('ic', 0.0)
+                metrics['train_sharpe'] = model_metrics.get('sharpe', 0.0)
         else:
-            metrics['active_model_version'] = None
-            metrics['model_sharpe'] = 0.0
-            metrics['model_ic'] = 0.0
-            metrics['model_max_drawdown'] = 0.0
-            metrics['model_age_days'] = 999
+             metrics['model_age_days'] = 999
+
+        # (New) Calculate Live IC20D (Information Coefficient 20-Day)
+        # Correlation between predictions 20 days ago and realized 20-day returns
+        try:
+            cursor.execute("""
+                WITH predictions AS (
+                    -- Get predictions from 20 days ago (approx)
+                    SELECT symbol, value as pred_score
+                    FROM features_gold
+                    WHERE feature_name = 'HunterScore' -- Using HunterScore as proxy for prediction
+                    AND effective_date = CURRENT_DATE - 20
+                ),
+                returns AS (
+                    -- Calculate realized 20-day return
+                    SELECT 
+                        t1.symbol,
+                        (t2.close - t1.close) / t1.close as realized_return
+                    FROM ta_silver t1
+                    JOIN ta_silver t2 ON t1.symbol = t2.symbol 
+                    WHERE t1.trade_date = CURRENT_DATE - 20
+                    AND t2.trade_date = CURRENT_DATE
+                )
+                SELECT corr(p.pred_score, r.realized_return) as ic_20d
+                FROM predictions p
+                JOIN returns r ON p.symbol = r.symbol
+            """)
+            row = cursor.fetchone()
+            metrics['live_ic_20d'] = float(row[0]) if row and row[0] is not None else 0.0
+        except Exception as e:
+            print(f"Error calculating IC20D: {e}")
+            metrics['live_ic_20d'] = 0.0
 
         # Label distribution
         cursor.execute("""
@@ -173,8 +199,13 @@ def collect_model_performance_metrics(conn) -> Dict:
         metrics['al_queue_pending'] = row[0] or 0
         metrics['al_queue_reviewed'] = row[1] or 0
         metrics['al_queue_snoozed'] = row[2] or 0
+        
+        # (New) AL Completion Rate
+        total_al = metrics['al_queue_pending'] + metrics['al_queue_reviewed']
+        metrics['al_completion_rate'] = (metrics['al_queue_reviewed'] / total_al) if total_al > 0 else 1.0
 
     return metrics
+
 
 # --- System Health Metrics ---
 
@@ -360,8 +391,41 @@ def collect_all_metrics(conn) -> Dict:
     all_metrics.update(collect_hmm_state_distribution(conn))
 
     print(f"✓ Collected {len(all_metrics)} metrics")
+    
+    # (New) Drift Alerting
+    check_drift_and_alert(all_metrics)
 
     return all_metrics
+
+def check_drift_and_alert(metrics: Dict):
+    """
+    Checks for drift or critical issues and sends alerts.
+    """
+    alerts = []
+    
+    # 1. Check PSI (Population Stability Index) if available
+    # Assuming psi_top_10 is tracked
+    if metrics.get('psi_top_10', 0) > 0.25:
+        alerts.append(f"CRITICAL: High Feature Drift (PSI={metrics['psi_top_10']:.2f})")
+        
+    # 2. Check HMM State Collapse
+    # If any state has > 90% of stocks, it's suspicious
+    for state in ['accumulation', 'breakout', 'euphoria', 'distribution']:
+        pct = metrics.get(f'hmm_{state}_pct', 0)
+        if pct > 90:
+            alerts.append(f"WARNING: HMM State Collapse ({state}={pct:.1f}%)")
+            
+    # 3. Check Data Staleness
+    if metrics.get('price_data_staleness_hours', 0) > 24:
+        alerts.append(f"CRITICAL: Price Data Stale (>24h)")
+        
+    # Send Alerts (Log for now, can be extended to Email/Slack)
+    if alerts:
+        print("\n🚨 *** SYSTEM ALERTS ***")
+        for alert in alerts:
+            print(f"  - {alert}")
+            # In production: send_slack_alert(alert)
+
 
 # --- Metrics Storage ---
 

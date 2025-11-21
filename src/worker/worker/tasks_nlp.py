@@ -9,6 +9,7 @@ from google.api_core import exceptions as google_exceptions
 
 from core_lib.db import get_db_connection
 from core_lib.locks import get_advisory_lock
+import re
 
 # --- Constants ---
 ADVISORY_LOCK_NAME = "nlp_batch"
@@ -31,9 +32,9 @@ genai.configure(api_key=GOOGLE_API_KEY)
 
 # Define the structured output schema for Gemini
 RESPONSE_SCHEMA = {
-    "sentiment_score": float, # From -1.0 (very negative) to 1.0 (very positive)
-    "catalysts": List[str],   # List of relevant keywords like "M&A", "EARNINGS_SURPRISE"
-    "summary": str,           # A very brief, one-sentence summary
+    "sentiment_score": "float",  # -1.0 (very negative) to +1.0 (very positive)
+    "catalysts": "list",         # List of detected events/catalysts
+    "summary": "str",            # A very brief, one-sentence summary
 }
 
 GENERATION_CONFIG = GenerationConfig(
@@ -48,19 +49,19 @@ SAFETY_SETTINGS = {
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
 }
 
-PROMPT_TEMPLATE = f"""
+PROMPT_TEMPLATE = """
 Analyze the sentiment of the following Vietnamese stock market news snippets.
 For each snippet, provide:
 1.  `sentiment_score`: A float between -1.0 (very negative) and 1.0 (very positive).
-2.  `catalysts`: A list of any relevant catalysts from this list: {list(CATALYST_KEYWORDS.keys())}. If none, return an empty list.
+2.  `catalysts`: A list of any relevant catalysts from this list: {catalyst_keywords}. If none, return an empty list.
 3.  `summary`: A concise, one-sentence summary in Vietnamese.
 
-Return a JSON object containing a key "results", which is a list of JSON objects matching this exact schema: {json.dumps(RESPONSE_SCHEMA)}.
+Return a JSON object containing a key "results", which is a list of JSON objects matching this exact schema: {schema}.
 Do not include any other text or explanations in your response.
 
 Here are the news snippets:
 ---
-{{news_snippets}}
+{news_snippets}
 ---
 """
 
@@ -75,14 +76,18 @@ def process_nlp_batch(docs: List[Tuple[str, str]]) -> List[Dict]:
         return []
 
     model = genai.GenerativeModel(
-        "gemini-1.5-flash",
+        "gemini-2.0-flash",
         generation_config=GENERATION_CONFIG,
         safety_settings=SAFETY_SETTINGS
     )
 
     # Format the input for the prompt
     formatted_snippets = "\n".join([f'{doc_id}: "{text}"' for doc_id, text in docs])
-    prompt = PROMPT_TEMPLATE.format(news_snippets=formatted_snippets)
+    prompt = PROMPT_TEMPLATE.format(
+        catalyst_keywords=list(CATALYST_KEYWORDS.keys()),
+        schema=json.dumps(RESPONSE_SCHEMA),
+        news_snippets=formatted_snippets
+    )
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -117,6 +122,18 @@ def process_nlp_batch(docs: List[Tuple[str, str]]) -> List[Dict]:
     print(f"ERROR: Batch failed after {MAX_RETRIES} retries.")
     return []
 
+
+def extract_symbols(text: str) -> List[str]:
+    """Extract stock symbols from text using regex pattern [A-Z]{3,7}."""
+    if not text:
+        return []
+    # Match 3-7 uppercase letters (Vietnamese stock symbols)
+    pattern = r'\b[A-Z]{3,7}\b'
+    symbols = re.findall(pattern, text)
+    # Deduplicate and filter common false positives
+    false_positives = {'THE', 'AND', 'FOR', 'ARE', 'WAS', 'NOT', 'BUT', 'ALL', 'CAN', 'HAD', 'HER', 'WAS', 'ONE', 'OUR', 'OUT', 'DAY'}
+    symbols = [s for s in set(symbols) if s not in false_positives]
+    return sorted(symbols)
 
 def scan_for_catalysts(text: str) -> Dict[str, bool]:
     """(AC16) Scans text for predefined catalyst keywords."""
@@ -179,7 +196,7 @@ def run_nlp_pipeline():
                 """, (bronze_id,))
 
                 bronze_row = cur.fetchone()
-                if bronze_row and bronze_row[0]:
+                if bronze_row and (bronze_row[0] or bronze_row[1]):
                     text, title = bronze_row
                     # Combine title and text for NLP
                     full_text = f"{title}. {text}" if title else text
@@ -216,19 +233,41 @@ def run_nlp_pipeline():
                     sentiment_score = result.get('sentiment_score')
                     catalysts = result.get('catalysts', [])
 
+                    # Get full text for symbol extraction
+                    cur.execute("""
+                        SELECT rb.payload_json->>'text', rb.payload_json->>'title'
+                        FROM sa_silver sa
+                        JOIN raw_bronze rb ON sa.bronze_ref_id = rb.id
+                        WHERE sa.url_canonical = %s
+                    """, (url_canonical,))
+                    
+                    text_row = cur.fetchone()
+                    full_text = ""
+                    symbols = []
+                    if text_row:
+                        text, title = text_row
+                        full_text = f"{title} {text}" if title and text else (title or text or "")
+                        symbols = extract_symbols(full_text)
+
+                    # Calculate hype_raw from sentiment_score (range -1 to +1)
+                    # hype_raw is absolute intensity regardless of direction
+                    hype_raw = abs(sentiment_score) if sentiment_score is not None else None
+
                     try:
-                        # Update sa_silver with sentiment_score
+                        # Update sa_silver with sentiment_score, symbols, and hype_raw
                         cur.execute("""
                             UPDATE sa_silver
-                            SET sentiment_score = %s
+                            SET sentiment_score = %s,
+                                symbols = %s,
+                                hype_raw = %s
                             WHERE url_canonical = %s
-                        """, (sentiment_score, url_canonical))
+                        """, (sentiment_score, symbols, hype_raw, url_canonical))
 
                         # Insert catalysts into catalyst_flags
                         if catalysts:
                             for catalyst in catalysts:
-                                catalyst_type = catalyst.get('type', 'UNKNOWN')
-                                catalyst_value = catalyst.get('value', 1.0)
+                                catalyst_type = catalyst
+                                catalyst_value = 1.0
 
                                 cur.execute("""
                                     INSERT INTO catalyst_flags
@@ -242,7 +281,7 @@ def run_nlp_pipeline():
 
                         total_processed += 1
 
-                        print(f"  ✓ {url_canonical}: sentiment={sentiment_score:.2f}, catalysts={len(catalysts)}")
+                        print(f"  ✓ {url_canonical}: sentiment={sentiment_score:.2f}, catalysts={len(catalysts)}, symbols={symbols}")
 
                     except Exception as e:
                         print(f"  ✗ Failed to save {url_canonical}: {e}")
@@ -259,6 +298,8 @@ def run_nlp_pipeline():
         conn.commit()
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"An error occurred in the NLP pipeline: {e}")
         if conn:
             conn.rollback()
