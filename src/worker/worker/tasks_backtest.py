@@ -27,11 +27,11 @@ def get_champion_challenger_models():
             cur.execute("SELECT model_version, metrics FROM model_registry WHERE is_active = true LIMIT 1;")
             champion = cur.fetchone()
 
-            # Challenger: The newest model for which backtest metrics are null
+            # Challenger: The newest model pending backtest
             cur.execute("""
                 SELECT model_version, metrics FROM model_registry
-                WHERE metrics IS NULL AND promotion_suggestion IS NULL
-                ORDER BY model_version DESC LIMIT 1;
+                WHERE promotion_suggestion = 'pending_backtest'
+                ORDER BY created_at DESC LIMIT 1;
             """)
             challenger = cur.fetchone()
 

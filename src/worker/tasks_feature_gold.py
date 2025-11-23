@@ -110,6 +110,112 @@ def apply_hmm(df: pl.DataFrame) -> pl.DataFrame:
     return pl.concat(all_states)
 
 
+def calculate_sector_stats(conn, as_of_date):
+    """
+    Calculate Sector Rotation metrics (RRG "Lite") at sub-sector level.
+    
+    For each sub-sector (e.g., banking, materials):
+    - RS-Ratio: 60-day average relative excess return vs VN-Index (long-term trend)
+    - RS-Momentum: Rate of change of RS-Ratio (short-term momentum)
+    
+    Args:
+        conn: Database connection
+        as_of_date: Date to calculate stats for
+    """
+    logger.info(f"Calculating sector stats for {as_of_date}")
+    
+    try:
+        with conn.cursor() as cur:
+            # Calculate RRG metrics for each sub-sector
+            # Using daily_sector_prices view and sector_perf if available
+            sql = """
+            WITH sector_returns AS (
+                -- Calculate daily returns for each sector
+                SELECT
+                    s.trade_date,
+                    s.sector,
+                    d.super_sector,
+                    s.close / LAG(s.close, 1) OVER (PARTITION BY s.sector ORDER BY s.trade_date) - 1 AS sector_return,
+                    i.close / LAG(i.close, 1) OVER (ORDER BY i.trade_date) - 1 AS index_return
+                FROM daily_sector_prices s
+                JOIN dim_sector d ON s.sector = d.sector
+                LEFT JOIN daily_vnindex_prices i ON s.trade_date = i.trade_date
+                WHERE s.trade_date BETWEEN %(start_date)s AND %(as_of_date)s
+            ),
+            excess_returns AS (
+                -- Calculate excess return (sector vs index)
+                SELECT
+                    trade_date,
+                    sector,
+                    super_sector,
+                    COALESCE(sector_return, 0) - COALESCE(index_return, 0) AS excess_return
+                FROM sector_returns
+            ),
+            rolling_metrics AS (
+                -- Calculate RS-Ratio (60-day avg) and RS-Momentum (5-day change)
+                SELECT
+                    sector,
+                    super_sector,
+                    trade_date,
+                    AVG(excess_return) OVER (
+                        PARTITION BY sector 
+                        ORDER BY trade_date 
+                        ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                    ) AS rs_ratio_60d,
+                    AVG(excess_return) OVER (
+                        PARTITION BY sector 
+                        ORDER BY trade_date 
+                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                    ) AS rs_ratio_20d
+                FROM excess_returns
+            ),
+            final_metrics AS (
+                SELECT
+                    sector,
+                    super_sector,
+                    trade_date,
+                    rs_ratio_60d,
+                    rs_ratio_60d - LAG(rs_ratio_60d, 5) OVER (PARTITION BY sector ORDER BY trade_date) AS rs_momentum
+                FROM rolling_metrics
+            )
+            -- Upsert into sector_stats
+            INSERT INTO sector_stats (sector, as_of_date, super_sector, rs_ratio, rs_momentum, momentum, breadth)
+            SELECT
+                sector,
+                trade_date AS as_of_date,
+                super_sector,
+                rs_ratio_60d * 100 + 100 AS rs_ratio,  -- Normalize to 100 = benchmark
+                COALESCE(rs_momentum * 100, 0) AS rs_momentum,  -- Normalize, 0 = no change
+                rs_ratio_20d AS momentum,  -- Keep existing momentum column
+                NULL AS breadth  -- Placeholder for breadth calculation
+            FROM final_metrics
+            WHERE trade_date = %(as_of_date)s
+            ON CONFLICT (sector, as_of_date) DO UPDATE SET
+                super_sector = EXCLUDED.super_sector,
+                rs_ratio = EXCLUDED.rs_ratio,
+                rs_momentum = EXCLUDED.rs_momentum,
+                momentum = EXCLUDED.momentum,
+                last_updated = NOW();
+            """
+            
+            # Calculate start date (need ~65 trading days of history for 60-day rolling)
+            # Using 150 calendar days to ensure sufficient trading days even during holidays (Tết)
+            from datetime import timedelta
+            start_date = as_of_date - timedelta(days=150)
+            
+            cur.execute(sql, {"as_of_date": as_of_date, "start_date": start_date})
+            row_count = cur.rowcount
+            logger.info(f"Updated sector stats for {row_count} sub-sectors")
+            
+            conn.commit()
+            return row_count
+            
+    except Exception as e:
+        logger.exception(f"Failed to calculate sector stats: {e}")
+        conn.rollback()
+        raise
+
+
 def run_sql_plus_plus_macro(conn, as_of_date, tz):
     """
     (Point 2, 3, 4, 5)
@@ -423,6 +529,11 @@ def run_feature_gold_batch():
             # This is called but the main logic inside is commented out until prerequisite tables exist.
             run_sql_plus_plus_macro(conn, as_of_date, MACRO_TZ_STR)
             logger.info(f"SQL++ Macro logic finished in {time.time() - start_time:.2f}s")
+
+            # Calculate sector rotation stats (RRG)
+            start_time = time.time()
+            calculate_sector_stats(conn, as_of_date)
+            logger.info(f"Sector stats calculation finished in {time.time() - start_time:.2f}s")
 
             # The view v_features_asof does not exist, so this will fail.
             # Using a placeholder query for now.

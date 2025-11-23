@@ -32,3 +32,6 @@ def get_advisory_lock(conn: Any, lock_name: str) -> bool:
     except Exception as e:
         print(f"Error acquiring advisory lock '{lock_name}': {e}")
         return False
+
+# Alias for compatibility
+try_lock = get_advisory_lock

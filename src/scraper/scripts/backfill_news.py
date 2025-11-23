@@ -9,38 +9,39 @@ Features:
 - Progress tracking and resume capability
 - Date range validation
 - Error handling and retry logic
+- Supports multiple sources: vnstock, google
 
 Usage:
-    # Backfill last 12 months for all symbols
+    # Backfill last 12 months for all symbols using vnstock
     python backfill_news.py --months 12
 
-    # Backfill specific symbol with custom delay
-    python backfill_news.py --symbol FPT --months 6 --delay 5
+    # Backfill using Google Search for FPT
+    python backfill_news.py --source google --symbol FPT --months 6
 
     # Resume interrupted backfill
     python backfill_news.py --months 12 --resume
 
 Example:
-    $ python backfill_news.py --months 12 --delay 3
-    Starting backfill for 10 symbols, 12 months back
-    Progress: FPT [====================] 100% (365 days)
-    Progress: TCB [====================] 100% (365 days)
+    $ python backfill_news.py --source google --months 6
+    Starting backfill for 10 symbols, 6 months back
+    Progress: FPT [====================] 100% (180 days)
     ...
-    Backfill complete: 3,650 articles collected
 """
 
 import argparse
 import sys
 import time
-from datetime import datetime, timedelta
-from typing import List, Optional
+import uuid
+from datetime import datetime, timedelta, date
+from typing import List, Optional, Dict, Any
 import logging
 
 # Add parent directory to path for imports
-sys.path.insert(0, '/home/duongtran/an-pj/mini-trading/source-code/src/scraper')
-sys.path.insert(0, '/home/duongtran/an-pj/mini-trading/source-code/src/core_lib')
+sys.path.insert(0, '/root/mini-trading-bot/mini-trading-bot/src/scraper')
+sys.path.insert(0, '/root/mini-trading-bot/mini-trading-bot/src/core_lib')
 
 from scraper.vnstock_source import VnStockSource
+from scraper.google_news_source import GoogleNewsSource
 from scraper.adapters import adapt_sa_data
 from scraper.ingestion import process_and_ingest_data
 from scraper.state_manager import ScraperStateManager, create_source_id
@@ -67,14 +68,19 @@ class NewsBackfiller:
         Initialize backfiller.
 
         Args:
-            source_name: Data source name
+            source_name: Data source name ('vnstock' or 'google')
             delay_seconds: Delay between requests (rate limiting)
             max_retries: Maximum retries per request
         """
         self.source_name = source_name
         self.delay_seconds = delay_seconds
         self.max_retries = max_retries
-        self.source = VnStockSource()
+        
+        if source_name == "google":
+            self.source = GoogleNewsSource()
+        else:
+            self.source = VnStockSource()
+            
         self.stats = {
             'symbols_processed': 0,
             'articles_collected': 0,
@@ -138,7 +144,7 @@ class NewsBackfiller:
         Returns:
             Number of articles collected
         """
-        logger.info(f"Backfilling {symbol} - {months_back} months")
+        logger.info(f"Backfilling {symbol} - {months_back} months (Source: {self.source_name})")
 
         conn = None
         articles_count = 0
@@ -156,63 +162,15 @@ class NewsBackfiller:
                     return 0
 
             # Calculate date range
-            end_date = datetime.now()
+            end_date = datetime.now().date()
             start_date = end_date - timedelta(days=months_back * 30)
 
-            logger.info(f"  Date range: {start_date.date()} to {end_date.date()}")
+            logger.info(f"  Date range: {start_date} to {end_date}")
 
-            # Fetch historical news
-            # Note: vnstock API may not support arbitrary historical ranges
-            # This is a best-effort approach
-            retry_count = 0
-            articles = None
-
-            while retry_count < self.max_retries:
-                try:
-                    # Fetch news (vnstock limitation: may only get recent news)
-                    # For true historical backfill, would need different source or API
-                    days_back = months_back * 30
-                    articles = self.source.fetch_latest_news(symbol, days=days_back)
-                    break
-
-                except Exception as e:
-                    retry_count += 1
-                    logger.warning(f"  Retry {retry_count}/{self.max_retries} for {symbol}: {e}")
-                    time.sleep(self.delay_seconds * retry_count)  # Exponential backoff
-
-            if articles is None:
-                logger.error(f"  ✗ Failed to fetch news for {symbol} after {self.max_retries} retries")
-                self.stats['errors'] += 1
-                return 0
-
-            # Process and ingest each article
-            for article in articles:
-                try:
-                    article_payload = {
-                        "id": article.get("id"),
-                        "source": article.get("source"),
-                        "url": article.get("url"),
-                        "text": article.get("text"),
-                        "publisher_time": article.get("published_at"),
-                        "first_seen_time": article.get("first_seen_time"),
-                        "entities": [symbol]
-                    }
-
-                    adapted_data = adapt_sa_data(article_payload)
-                    process_and_ingest_data(
-                        raw_data=adapted_data.model_dump(),
-                        source_name=self.source_name,
-                        task_kind="NLP_PROCESS"
-                    )
-
-                    articles_count += 1
-
-                except Exception as e:
-                    logger.debug(f"  Skipped article (likely duplicate): {e}")
-                    self.stats['articles_duplicates'] += 1
-
-                # Rate limiting
-                time.sleep(self.delay_seconds)
+            if self.source_name == "google":
+                articles_count = self._backfill_google(symbol, start_date, end_date)
+            else:
+                articles_count = self._backfill_vnstock(symbol, months_back)
 
             # Mark as backfilled
             backfill_cursor = f"BACKFILL_COMPLETE_{end_date.strftime('%Y%m%d')}"
@@ -231,6 +189,128 @@ class NewsBackfiller:
                 conn.close()
 
         return articles_count
+
+    def _backfill_vnstock(self, symbol: str, months_back: int) -> int:
+        """Backfill using vnstock source (best effort)."""
+        retry_count = 0
+        articles = None
+
+        while retry_count < self.max_retries:
+            try:
+                days_back = months_back * 30
+                articles = self.source.fetch_latest_news(symbol, days=days_back)
+                break
+            except Exception as e:
+                retry_count += 1
+                logger.warning(f"  Retry {retry_count}/{self.max_retries} for {symbol}: {e}")
+                time.sleep(self.delay_seconds * retry_count)
+
+        if articles is None:
+            logger.error(f"  ✗ Failed to fetch news for {symbol} after {self.max_retries} retries")
+            self.stats['errors'] += 1
+            return 0
+
+        count = 0
+        for article in articles:
+            try:
+                article_payload = {
+                    "id": article.get("id"),
+                    "source": article.get("source"),
+                    "url": article.get("url"),
+                    "text": article.get("text"),
+                    "publisher_time": article.get("published_at"),
+                    "first_seen_time": article.get("first_seen_time"),
+                    "entities": [symbol]
+                }
+                self._ingest_article(article_payload)
+                count += 1
+            except Exception as e:
+                logger.debug(f"  Skipped article: {e}")
+                self.stats['articles_duplicates'] += 1
+            
+            time.sleep(self.delay_seconds)
+            
+        return count
+
+    def _backfill_google(self, symbol: str, start_date: date, end_date: date) -> int:
+        """Backfill using Google Search with sliding window."""
+        chunk_size_days = 7
+        current_chunk_end = end_date
+        total_count = 0
+
+        while current_chunk_end > start_date:
+            current_chunk_start = max(start_date, current_chunk_end - timedelta(days=chunk_size_days))
+            
+            logger.info(f"    Fetching chunk: {current_chunk_start} -> {current_chunk_end}")
+            
+            retry_count = 0
+            articles = []
+            
+            while retry_count < self.max_retries:
+                try:
+                    articles = self.source.fetch_news_chunk(symbol, current_chunk_start, current_chunk_end)
+                    break
+                except Exception as e:
+                    retry_count += 1
+                    logger.warning(f"    Retry {retry_count}/{self.max_retries}: {e}")
+                    # Exponential backoff
+                    time.sleep(self.delay_seconds * (2 ** retry_count))
+
+            if not articles:
+                logger.debug(f"    No articles found in chunk.")
+            else:
+                for item in articles:
+                    try:
+                        # Map Google result to SAData
+                        # Google returns: {'title': ..., 'url': ..., 'source': ..., 'published_at': ...}
+                        
+                        # Generate a deterministic ID based on URL
+                        article_id = str(uuid.uuid5(uuid.NAMESPACE_URL, item.get('url', '')))
+                        
+                        # Parse published_at if possible, else use current time or chunk start
+                        pub_time = item.get('published_at')
+                        if not pub_time:
+                            pub_time = datetime.combine(current_chunk_start, datetime.min.time())
+                        elif isinstance(pub_time, str):
+                            try:
+                                # Try parsing common formats if needed, but Gemini might return ISO
+                                pub_time = datetime.fromisoformat(pub_time.replace('Z', '+00:00'))
+                            except:
+                                pub_time = datetime.combine(current_chunk_start, datetime.min.time())
+
+                        article_payload = {
+                            "id": article_id,
+                            "source": item.get("source", "google_search"),
+                            "url": item.get("url"),
+                            "title": item.get("title"),
+                            "text": f"{item.get('title')} {item.get('snippet', '')}".strip(),
+                            "publisher_time": pub_time,
+                            "first_seen_time": datetime.now(),
+                            "entities": [symbol]
+                        }
+                        
+                        self._ingest_article(article_payload)
+                        total_count += 1
+                    except Exception as e:
+                        logger.debug(f"    Skipped article: {e}")
+                        self.stats['articles_duplicates'] += 1
+
+            # Move window back
+            current_chunk_end = current_chunk_start - timedelta(days=1)
+            
+            # Rate limiting between chunks
+            time.sleep(self.delay_seconds)
+
+        return total_count
+
+    def _ingest_article(self, article_payload: Dict[str, Any]):
+        """Helper to adapt and ingest article data."""
+        adapted_data = adapt_sa_data(article_payload)
+        process_and_ingest_data(
+            raw_data=adapted_data.model_dump(),
+            source_name=self.source_name,
+            task_kind="NLP_PROCESS"
+        )
 
     def run(
         self,
@@ -254,6 +334,7 @@ class NewsBackfiller:
 
         logger.info("=" * 60)
         logger.info(f"Starting backfill: {len(symbols)} symbols, {months_back} months")
+        logger.info(f"Source: {self.source_name}")
         logger.info(f"Rate limit: {self.delay_seconds}s delay between requests")
         logger.info(f"Resume mode: {'ENABLED' if resume else 'DISABLED'}")
         logger.info("=" * 60)
@@ -286,8 +367,8 @@ Examples:
   # Backfill 12 months for all symbols
   python backfill_news.py --months 12
 
-  # Backfill 24 months for FPT with 5s delay
-  python backfill_news.py --symbol FPT --months 24 --delay 5
+  # Backfill using Google Search for FPT
+  python backfill_news.py --source google --symbol FPT --months 6
 
   # Resume interrupted backfill
   python backfill_news.py --months 12 --resume
@@ -306,6 +387,14 @@ Examples:
         type=str,
         default=None,
         help='Specific symbol to backfill (default: all active symbols)'
+    )
+    
+    parser.add_argument(
+        '--source',
+        type=str,
+        default='vnstock',
+        choices=['vnstock', 'google'],
+        help='Data source to use (default: vnstock)'
     )
 
     parser.add_argument(
@@ -341,15 +430,16 @@ Examples:
     # Dry run
     if args.dry_run:
         logger.info("DRY RUN MODE - No data will be collected")
-        backfiller = NewsBackfiller(delay_seconds=args.delay)
+        backfiller = NewsBackfiller(source_name=args.source, delay_seconds=args.delay)
         symbols = backfiller.get_symbols(args.symbol)
         logger.info(f"Would backfill {len(symbols)} symbols: {', '.join(symbols)}")
+        logger.info(f"Source: {args.source}")
         logger.info(f"Date range: ~{args.months} months back")
         logger.info(f"Rate limit: {args.delay}s delay")
         sys.exit(0)
 
     # Run backfill
-    backfiller = NewsBackfiller(delay_seconds=args.delay)
+    backfiller = NewsBackfiller(source_name=args.source, delay_seconds=args.delay)
     backfiller.run(
         months_back=args.months,
         specific_symbol=args.symbol,

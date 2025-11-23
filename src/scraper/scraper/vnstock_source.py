@@ -87,6 +87,10 @@ class VnStockSource(PriceSource, NewsSource):
                 logger.warning(f"No news data returned for {symbol}")
                 return []
             
+            logger.info(f"News columns: {news_df.columns.tolist()}")
+            if not news_df.empty:
+                logger.info(f"First news row: {news_df.iloc[0].to_dict()}")
+            
             # Calculate date threshold
             threshold_date = datetime.now() - timedelta(days=days)
             
@@ -101,11 +105,11 @@ class VnStockSource(PriceSource, NewsSource):
                 article = {
                     'id': str(row.get('id', row.get('newsID', ''))),
                     'source': row.get('source', 'TCBS'),
-                    'url': row.get('link', row.get('href', '')),
+                    'url': f"https://tcinvest.tcbs.com.vn/news/{row.get('id')}" if row.get('id') else "",
                     'title': row.get('title', ''),
-                    'text': row.get('content', row.get('description', '')),
-                    'published_at': row.get('publishDate', datetime.now()).isoformat() if pd.notna(row.get('publishDate')) else datetime.now().isoformat(),
-                    'first_seen_time': datetime.now().isoformat(),
+                    'text': row.get('content', row.get('description', row.get('title', ''))), # Fallback to title
+                    'published_at': row.get('publishDate', datetime.now()) if pd.notna(row.get('publishDate')) else datetime.now(),
+                    'first_seen_time': datetime.now(),
                 }
                 news_list.append(article)
             

@@ -203,11 +203,11 @@ def apply_sa_sanity_rules(payload: dict) -> Tuple[bool, Optional[str], Optional[
         payload['language'] = 'unknown'
         print(f"WARN: Invalid language '{language}', set to 'unknown'")
 
-    # Rule 5: Content validation (text >= 120 chars)
+    # Rule 5: Content validation (text >= 10 chars)
     text_normalized = payload.get('text_normalized', '') or payload.get('text', '')
-    if len(text_normalized) < 120:
+    if len(text_normalized) < 10:
         return False, 'sa_rule_5_text_too_short', \
-            f'Text length {len(text_normalized)} < 120 chars (after HTML removal)'
+            f'Text length {len(text_normalized)} < 10 chars (after HTML removal)'
 
     # Rule 6: Hash validation
     content_hash = payload.get('content_hash', '') or payload.get('text_norm_hash', '')
@@ -376,17 +376,18 @@ def fetch_bronze_data(conn, bronze_id: str) -> Optional[dict]:
     """
     with conn.cursor() as cursor:
         cursor.execute(
-            "SELECT payload_json, id FROM raw_bronze WHERE id = %s",
+            "SELECT payload_json, id, content_hash FROM raw_bronze WHERE id = %s",
             (bronze_id,)
         )
         row = cursor.fetchone()
         if not row:
             return None
         
-        payload_json, uuid = row
+        payload_json, uuid, content_hash = row
         # Add bronze_ref_id for tracking
         if isinstance(payload_json, dict):
             payload_json['bronze_ref_id'] = str(uuid)
+            payload_json['content_hash'] = content_hash
         return payload_json
 
 # --- Backpressure Control (AC7) ---

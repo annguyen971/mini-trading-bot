@@ -121,6 +121,7 @@ services:
     env_file: .env
     environment:
       - DB_URL=${DB_URL}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
     depends_on:
       db: { condition: service_healthy }
     logging:
@@ -155,7 +156,7 @@ services:
   # 8. CRON (SIDECAR)
   cron:
     build: ./src/cron
-    profiles: [ "cron" ]
+    # profiles: [ "cron" ]  # Removed - always run in production
     volumes:
       - ./scripts/cron:/etc/periodic/custom:ro
       - /var/run/docker.sock:/var/run/docker.sock # Để chạy docker exec

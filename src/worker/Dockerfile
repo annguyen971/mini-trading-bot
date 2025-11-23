@@ -12,7 +12,7 @@ COPY . .
 RUN pip install ./core_lib
 
 # 2. Cài đặt các thư viện public của 'worker' (từ pyproject.toml)
-RUN pip install --no-cache-dir psycopg[binary] polars pandas sqlalchemy scikit-learn hmmlearn pyarrow adbc-driver-postgresql connectorx google-generativeai
+RUN pip install --no-cache-dir psycopg[binary] polars pandas sqlalchemy scikit-learn hmmlearn pyarrow adbc-driver-postgresql connectorx google-generativeai vectorbt
 
 # 3. Cài đặt 'worker' mà KHÔNG KIỂM TRA dependency
 RUN pip install --no-deps ./worker

@@ -26,6 +26,7 @@ class SAData(BaseModel):
     source: str
     author: Optional[str] = None
     url: Optional[str] = ""
+    title: Optional[str] = ""
     text: Optional[str] = ""
     publisher_time: datetime
     first_seen_time: datetime

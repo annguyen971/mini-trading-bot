@@ -14,8 +14,8 @@ rate_limiter = RateLimiter(requests_per_minute=60)
 circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=600)
 
 # --- Configuration ---
-NEWS_LOOKBACK_DAYS = 7
-PRICE_LOOKBACK_DAYS = 90
+NEWS_LOOKBACK_DAYS = 180
+PRICE_LOOKBACK_DAYS = 180
 DEFAULT_WATCHLIST = ["FPT", "TCB", "VNM"]  # Fallback if DB fails
 
 def get_active_watchlist(user_id: str = 'admin') -> List[str]:
@@ -116,6 +116,20 @@ def main():
         print("⚠ Backpressure ENABLED. Reducing rate to 30 req/min.")
         rate_limiter.set_requests_per_minute(30)
 
+    # --- Macro Data Refresh (P2 - Real-time Macro) ---
+    print("\nRefreshing Macro Data...")
+    try:
+        from scraper.macro_sources import refresh_macro_data_from_vnstock
+        if refresh_macro_data_from_vnstock():
+            print("✓ Macro data updated successfully")
+        else:
+            print("⚠ Macro data refresh returned failure status")
+    except ImportError:
+        print("⚠ scraper.macro_sources module not found (requires rebuild)")
+    except Exception as e:
+        print(f"⚠ Macro data refresh failed: {e}")
+
+
     # --- Fetch, Adapt, and Ingest Data ---
     print(f"\nProcessing {len(WATCHLIST)} symbols...")
     print("=" * 60)
@@ -164,7 +178,7 @@ def main():
             else:
                 print(f"Fetching news for {symbol} (first run)...")
                 # First run - fetch more history
-                raw_news_data = source.fetch_latest_news(symbol, days=NEWS_LOOKBACK_DAYS * 4)
+                raw_news_data = source.fetch_latest_news(symbol, days=NEWS_LOOKBACK_DAYS)
 
             if raw_news_data:
                 processed_count = 0
@@ -195,6 +209,7 @@ def main():
                         processed_count += 1
                     except Exception as e:
                         # Skip duplicates or malformed articles
+                        print(f"Error processing article: {e}")
                         pass
 
                 print(f"Successfully processed {processed_count}/{len(raw_news_data)} news articles for {symbol}.")

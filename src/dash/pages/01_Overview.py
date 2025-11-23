@@ -1,6 +1,7 @@
 import streamlit as st
 import httpx
 import json
+from datetime import date
 from utils import get_api_client, show_safety_banner
 
 # --- API Functions ---
@@ -108,6 +109,50 @@ def submit_sts_feedback(symbol: str, score: int, comment: str):
         st.error(f"Failed to submit feedback: {e}")
         return False
 
+def get_predator_analysis(symbol: str):
+    """Fetches Apex Predator analysis."""
+    try:
+        with get_api_client() as client:
+            response = client.post("/analyze/predator", json={"symbol": symbol}, timeout=60.0)
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        st.error(f"Predator Analysis failed: {e}")
+    return None
+
+def save_user_prediction(symbol: str, prediction: str):
+    """Saves user prediction to journal."""
+    try:
+        with get_api_client() as client:
+            response = client.post("/predator/journal/save", json={"symbol": symbol, "user_prediction": prediction})
+            response.raise_for_status()
+            return True
+    except Exception as e:
+        st.error(f"Failed to save prediction: {e}")
+        return False
+
+def get_deja_vu(symbol: str):
+    """Fetches Deja Vu similar days."""
+    try:
+        with get_api_client() as client:
+            response = client.get(f"/deja_vu/{symbol}")
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        st.error(f"Deja Vu failed: {e}")
+    return []
+
+def get_simulation(symbol: str, overrides: dict):
+    """Runs What-If Simulation."""
+    try:
+        with get_api_client() as client:
+            response = client.post("/analyze/simulate", json={"symbol": symbol, "overrides": overrides})
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        st.error(f"Simulation failed: {e}")
+    return None
+
 
 # --- UI Layout ---
 st.set_page_config(layout="wide")
@@ -133,14 +178,124 @@ if symbol:
         with st.expander("Plain Language Explanation", expanded=True):
             st.markdown(data.get('plain_explainer', 'No explanation available.'))
             
-            st.divider()
-            st.markdown("### 🧠 Deep Analysis")
-            if st.button("✨ Ask AI Advisor"):
-                with st.spinner("Consulting AI Advisor (Gemini 3.0)..."):
-                    ai_result = get_ai_analysis(symbol)
-                    if ai_result:
-                        st.markdown(ai_result.get("analysis", "No analysis returned."))
-                        st.caption(f"Analysis by {ai_result.get('model', 'unknown model')}")
+        # --- Apex Predator Training Lab (Story 6.3) ---
+        st.divider()
+        st.markdown("### 🎯 Apex Predator Training Lab")
+        
+        # Session State for Reveal
+        reveal_key = f"analysis_revealed_{symbol}_{date.today()}"
+        if reveal_key not in st.session_state:
+            st.session_state[reveal_key] = False
+            
+        if not st.session_state[reveal_key]:
+            # LOCKED VIEW
+            st.info("🔒 **Hồ Sơ Mật**: Phân tích kịch bản thị trường & Dòng tiền thông minh.")
+            st.markdown("Để xem phân tích của AI Predator (Trưởng Ban Tự Doanh), bạn phải đưa ra nhận định trước.")
+            
+            user_pred = st.text_area("📝 Nhận định của bạn (Kịch bản là gì? Gom hay Xả?):", 
+                                     height=100,
+                                     key=f"pred_{symbol}",
+                                     help="Ví dụ: Tôi nghĩ đây là giai đoạn gom hàng vì vol thấp...")
+            
+            # Anti-cheat: Min 20 chars
+            can_unlock = len(user_pred.strip()) >= 20
+            
+            if st.button("🔓 Mở Hồ Sơ Mật", disabled=not can_unlock):
+                if save_user_prediction(symbol, user_pred):
+                    st.session_state[reveal_key] = True
+                    st.rerun()
+        else:
+            # REVEALED VIEW
+            with st.spinner("Đang giải mã hồ sơ..."):
+                ai_data = get_predator_analysis(symbol)
+            
+            if ai_data:
+                analysis = ai_data.get('ai_analysis', {})
+                
+                # Comparison Layout
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("#### 👤 Nhận định của bạn")
+                    st.info(st.session_state.get(f"pred_{symbol}", "Đã lưu vào Nhật ký."))
+                    
+                with c2:
+                    st.markdown("#### 🤖 AI Predator")
+                    st.markdown(f"**Kịch bản:** `{ai_data.get('scenario_tag')}`")
+                    st.markdown(f"**Vùng kẹp:** `{ai_data.get('trapped_price'):,.0f}`")
+                
+                # Memo
+                st.markdown("---")
+                st.markdown("### 📋 Memo Nội Bộ")
+                st.error(f"**TO: TRADING DESK**\n\n{analysis.get('predator_memo', 'N/A')}")
+                
+                with st.expander("📊 Giải thích Kỹ thuật (Quant)", expanded=True):
+                    st.markdown(analysis.get('quant_explanation', 'N/A'))
+                    
+                with st.expander("🛡️ Kế hoạch Hành động (Playbook)"):
+                    st.success(analysis.get('user_playbook', 'N/A'))
+
+        # --- Deja Vu Engine (Story 6.4) ---
+        st.divider()
+        st.markdown("### 🕰️ Deja Vu Engine")
+        
+        if st.button("🔍 Tìm kiếm Quá khứ (Deja Vu)"):
+            with st.spinner("Scanning historical patterns..."):
+                similar_days = get_deja_vu(symbol)
+                
+            if similar_days:
+                st.success(f"Found {len(similar_days)} similar historical patterns.")
+                
+                cols = st.columns(len(similar_days))
+                for i, day in enumerate(similar_days):
+                    with cols[i]:
+                        st.markdown(f"**{day['date']}**")
+                        st.caption(f"Similarity: {day['similarity_score']:.2%}")
+                        st.markdown(f"Context: `{day['scenario_context']}`")
+                        
+                        ret = day['return_t5']
+                        color = "green" if ret > 0 else "red"
+                        st.markdown(f"T+5 Return: :{color}[{ret:.1%}]")
+            else:
+                st.info("No similar patterns found (or insufficient history).")
+
+        # --- What-If Simulator (Story 6.5) ---
+        st.divider()
+        st.markdown("### 🧪 What-If Simulator")
+        st.caption("Giả lập thay đổi tham số để xem kịch bản thị trường thay đổi như thế nào.")
+        
+        with st.expander("Open Simulator"):
+            sim_col1, sim_col2 = st.columns(2)
+            with sim_col1:
+                sim_vol = st.slider("Volume Relative (vs 20d avg)", 0.0, 5.0, 1.0, 0.1)
+                sim_price = st.slider("Price Change (%)", -10.0, 10.0, 0.0, 0.5) / 100.0
+            with sim_col2:
+                sim_crowd = st.slider("Crowd Hype (Z-Score)", -3.0, 3.0, 0.0, 0.1)
+                sim_elite = st.slider("Elite Hype (Z-Score)", -3.0, 3.0, 0.0, 0.1)
+                
+            if st.button("Run Simulation"):
+                overrides = {
+                    "vol_rel": sim_vol,
+                    "price_change": sim_price,
+                    "hype_crowd_z": sim_crowd,
+                    "hype_elitist_z": sim_elite
+                }
+                sim_result = get_simulation(symbol, overrides)
+                
+                if sim_result:
+                    st.markdown(f"**Simulated Scenario:** `{sim_result.get('scenario_tag')}`")
+                    
+                    # Visual feedback
+                    tag = sim_result.get('scenario_tag')
+                    if tag == "DISTRIBUTION_CLIMAX":
+                        st.error("⚠️ DANGER: Distribution Detected!")
+                    elif tag == "STEALTH_ACCUMULATION":
+                        st.success("✅ OPPORTUNITY: Stealth Accumulation!")
+                    elif tag == "SHAKEOUT":
+                        st.warning("🌪️ CAUTION: Shakeout!")
+                    elif tag == "UPTHRUST":
+                        st.error("⛔ WARNING: Upthrust (Trap)!")
+                    else:
+                        st.info("Neutral / Unclear")
 
         # --- Signal Trust Score (STS) Survey (FR14) ---
         st.divider()

@@ -16,6 +16,11 @@ from slowapi.errors import RateLimitExceeded
 from prometheus_fastapi_instrumentator import Instrumentator
 import google.generativeai as genai
 from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockThreshold
+from typing import Dict
+import pandas as pd
+import numpy as np
+from core_lib.predator_scenarios import detect_scenario, calculate_pain_levels
+from api.deja_vu import find_similar_days
 
 
 
@@ -145,6 +150,17 @@ async def verify_admin_key(x_admin_key: str = Header(None)):
 class AIAnalysisRequest(BaseModel):
     symbol: str
 
+class PredatorAnalysisRequest(BaseModel):
+    symbol: str
+
+class PredatorJournalEntry(BaseModel):
+    symbol: str
+    user_prediction: str
+
+class SimulationRequest(BaseModel):
+    symbol: str
+    overrides: Dict[str, float]
+
 @app.post("/analyze/ai", dependencies=[Depends(verify_admin_key)])
 async def analyze_ai(request: AIAnalysisRequest):
     """
@@ -229,7 +245,7 @@ async def analyze_ai(request: AIAnalysisRequest):
     # 2. Call Gemini
     try:
         model = genai.GenerativeModel(
-            "gemini-2.0-flash",
+            "gemini-flash-latest",
             generation_config=AI_GENERATION_CONFIG,
             safety_settings=AI_SAFETY_SETTINGS
         )
@@ -266,6 +282,302 @@ async def analyze_ai(request: AIAnalysisRequest):
     except Exception as e:
         print(f"AI Analysis failed: {e}")
         raise HTTPException(status_code=500, detail=f"AI Analysis failed: {str(e)}")
+
+PREDATOR_SYSTEM_INSTRUCTION = """
+BẠN LÀ MỘT "MARKET MAKER" (NHÀ TẠO LẬP THỊ TRƯỜNG) TÀN NHẪN.
+
+**Vai trò:** Trưởng Ban Tự Doanh (Head of Prop Trading) của một quỹ đầu tư "Cá Mập" tại Việt Nam. 
+- Bạn KHÔNG tư vấn, bạn RA LỆNH thao túng.
+- Bạn coi nhà đầu tư nhỏ lẻ (F0) là "nguồn thanh khoản" (liquidity) để chốt lời hoặc gom hàng.
+- Giọng văn: Lạnh lùng, ngắn gọn, dùng thuật ngữ lóng chứng khoán (Úp bô, Kéo xả, Rũ cung, Washout).
+
+**Nhiệm vụ:** Dựa trên Kịch bản (Scenario) và Dữ liệu thị trường, hãy viết một MEMO NỘI BỘ (TỐI MẬT) gửi đội Trading Desk.
+
+**Quy tắc Phân tích:**
+1. **Vùng Kẹp Hàng (Trapped Zone):** - Nếu Giá < Trapped Price: Đó là kháng cự. Dùng nó để "rung cây" (Shakeout) cho nhỏ lẻ ói hàng.
+   - Nếu Giá > Trapped Price: Đó là hỗ trợ tâm lý. Dùng nó để phân phối giá cao.
+2. **Vĩ mô (Macro):** Luôn dùng tin tức vĩ mô (GDP, Lãi suất) làm "bình phong" (cover story) để hợp thức hóa hành động giá.
+3. **Dòng tiền (Flow):** - Crowd hưng phấn (Z > 1.5) + Elite bán ròng -> CƠ HỘI XẢ.
+   - Crowd hoảng loạn (Z < -1.5) + Elite mua ròng -> CƠ HỘI GOM.
+
+**Định dạng Output (Bắt buộc JSON):**
+{
+  "predator_memo": "Văn bản chỉ đạo (< 100 từ). Ví dụ: 'Sáng mai kéo gap-up dụ cầu, chiều xả thẳng vào dư mua trần.'",
+  "quant_explanation": "Giải thích kỹ thuật khách quan cho người dùng (tại sao lại có kịch bản này). Dùng ngôn ngữ VSA/Wyckoff.",
+  "user_playbook": "Lời khuyên hành động cụ thể cho F0 để không bị làm thịt (Bán ngay/Mua gom/Đứng ngoài)."
+}
+"""
+
+@app.post("/analyze/predator", dependencies=[Depends(verify_admin_key)])
+async def analyze_predator(request: PredatorAnalysisRequest):
+    """
+    (Story 6.2) Apex Predator Analysis.
+    Integrates Scenario Engine + Gemini 2.0 Flash + Persona.
+    """
+    symbol = request.symbol
+    print(f"[PREDATOR] Analyzing symbol: {symbol}")
+    await update_control_flags_cache()
+    
+    if app.state.control_flags_cache["data"].get("KILL_SWITCH", {}).get("enabled", False):
+        raise HTTPException(status_code=503, detail="Service is under maintenance.")
+    
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=503, detail="AI Service not configured.")
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        
+        # 1. Fetch Data
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            # Features Gold
+            cur.execute("SELECT * FROM features_gold_serving WHERE symbol = %s ORDER BY effective_date DESC LIMIT 1", (symbol,))
+            latest_features = cur.fetchone()
+            
+            # TA Silver (for calc)
+            cur.execute("SELECT close, volume FROM ta_silver WHERE symbol = %s ORDER BY trade_date DESC LIMIT 21", (symbol,))
+            ta_rows = cur.fetchall()
+            
+            # SA Silver (for calc)
+            cur.execute("SELECT hype_raw FROM sa_silver WHERE %s = ANY(symbols) ORDER BY publisher_time_utc DESC LIMIT 30", (symbol,))
+            sa_rows = cur.fetchall()
+            
+            # History (for Liquidity Map)
+            cur.execute("SELECT close, volume FROM ta_silver WHERE symbol = %s ORDER BY trade_date ASC LIMIT 100", (symbol,))
+            history_rows = cur.fetchall()
+            
+            # Macro
+            cur.execute("SELECT metric_name, value FROM macro_clean")
+            macro_rows = cur.fetchall()
+            macro_dict = {r['metric_name']: r['value'] for r in macro_rows}
+
+        if not latest_features:
+            raise HTTPException(status_code=404, detail=f"No feature data for {symbol}")
+
+        # 2. Calculate Real-time Features
+        # Price Change & Vol Rel
+        price_change = 0.0
+        vol_rel = 1.0
+        current_price = 0.0
+        if len(ta_rows) >= 2:
+            latest_ta = ta_rows[0]
+            current_price = latest_ta['close']
+            prev_ta = ta_rows[1]
+            if prev_ta['close']:
+                price_change = (latest_ta['close'] - prev_ta['close']) / prev_ta['close']
+            
+            vols = [r['volume'] for r in ta_rows[1:]]
+            if vols:
+                avg_vol = sum(vols) / len(vols)
+                if avg_vol > 0:
+                    vol_rel = latest_ta['volume'] / avg_vol
+
+        # Crowd Hype Z
+        hype_crowd_z = 0.0
+        hype_values = [r['hype_raw'] for r in sa_rows if r['hype_raw'] is not None]
+        if len(hype_values) > 5:
+            mean_hype = np.mean(hype_values)
+            std_hype = np.std(hype_values)
+            if std_hype > 0:
+                hype_crowd_z = (hype_values[0] - mean_hype) / std_hype
+
+        # Elitist Hype Z (Proxy via HunterScore)
+        hunter_score = latest_features.get('HunterScore') or latest_features.get('hunterscore') or 50.0
+        hype_elitist_z = (hunter_score - 50.0) / 25.0
+
+        # 3. Run Scenario Engine
+        f_dict = {
+            'hmm_state': latest_features.get('hmm_state'),
+            'hype_crowd_z': float(hype_crowd_z),
+            'hype_elitist_z': float(hype_elitist_z),
+            'price_change': float(price_change),
+            'vol_rel': float(vol_rel)
+        }
+        
+        scenario_tag = detect_scenario(f_dict)
+        
+        # Liquidity Map
+        trapped_data = {'price': 0.0, 'vol_ratio': 0.0}
+        if history_rows:
+            df_hist = pd.DataFrame([dict(r) for r in history_rows])
+            trapped_data = calculate_pain_levels(df_hist)
+
+        # 4. Call Gemini 2.0 Flash with System Instruction
+        model = genai.GenerativeModel(
+            "gemini-2.0-flash",
+            generation_config=AI_GENERATION_CONFIG,
+            safety_settings=AI_SAFETY_SETTINGS,
+            system_instruction=PREDATOR_SYSTEM_INSTRUCTION
+        )
+        
+        # Dynamic Prompt Construction
+        prompt = f"""
+        **ĐỐI TƯỢNG:** Cổ phiếu {symbol}
+        
+        **1. TÍN HIỆU KỸ THUẬT (The Setup):**
+        - Kịch bản phát hiện: {scenario_tag} (Độ tin cậy: Cao)
+        - Trạng thái HMM: {latest_features.get('hmm_state')}
+        
+        **2. DỮ LIỆU DÒNG TIỀN (The Flow):**
+        - Đám đông (Crowd Z-Score): {hype_crowd_z:.2f} ( >1.5=FOMO, <-1.5=Hoảng loạn)
+        - Tinh hoa (Elite Z-Score): {hype_elitist_z:.2f}
+        
+        **3. VÙNG TỬ ĐỊA (Liquidity Map):**
+        - Giá kẹp hàng lớn nhất (Max Pain): {trapped_data['price']}
+        - Khối lượng kẹp: {trapped_data['vol_ratio']:.1%} tổng vol 60 ngày.
+        - Giá hiện tại: {current_price}
+        
+        **4. BỐI CẢNH VĨ MÔ (The Cover Story):**
+        - GDP: {macro_dict.get('GDP_YOY', 'N/A')}%
+        - Lãi suất: {macro_dict.get('POLICY_RATE', 'N/A')}%
+        
+        **YÊU CẦU HÀNH ĐỘNG:**
+        Dựa trên dữ liệu trên, hãy viết Memo. 
+        - Nếu Crowd đang FOMO và Elite đang bán: Hãy chỉ đạo ÚP BÔ. Dùng tin vĩ mô tốt để lừa họ.
+        - Nếu Crowd đang sợ và Elite đang mua: Hãy chỉ đạo ĐÈ GOM. Dùng tin xấu hoặc vùng kẹp hàng để ép họ cắt lỗ.
+        - Nếu NEUTRAL: Hãy chê thị trường nhạt nhẽo, ra lệnh ngồi im.
+        """
+        
+        response = model.generate_content(prompt)
+        response_text = response.text.strip().replace("```json", "").replace("```", "")
+        ai_result = json.loads(response_text)
+        
+        return {
+            "symbol": symbol,
+            "scenario_tag": scenario_tag,
+            "trapped_price": trapped_data['price'],
+            "ai_analysis": ai_result
+        }
+
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Predator Analysis failed: {e}")
+        print(f"Full traceback:\n{error_details}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
+
+@app.post("/predator/journal/save", dependencies=[Depends(verify_admin_key)])
+async def save_predator_journal(entry: PredatorJournalEntry):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO predator_journal (symbol, as_of_date, user_prediction, user_id)
+                VALUES (%s, CURRENT_DATE, %s, 'admin')
+            """, (entry.symbol, entry.user_prediction))
+            conn.commit()
+        return {"status": "saved"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
+
+@app.get("/deja_vu/{symbol}", dependencies=[Depends(verify_admin_key)])
+async def get_deja_vu(symbol: str):
+    """
+    (Story 6.4) Deja Vu Engine.
+    Returns similar historical days.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            # Get current features
+            cur.execute("SELECT * FROM features_gold_serving WHERE symbol = %s ORDER BY effective_date DESC LIMIT 1", (symbol,))
+            latest = cur.fetchone()
+            
+            if not latest:
+                 raise HTTPException(status_code=404, detail="No features found")
+                 
+            # Construct features dict
+            features = {
+                'hmm_state': latest['hmm_state'],
+                'FrothScore': latest.get('FrothScore'),
+                'HunterScore': latest.get('HunterScore')
+            }
+            
+            # Run Deja Vu
+            # We close conn here because find_similar_days opens its own connection?
+            # Ideally pass conn to it. But my implementation opens its own.
+            # So it's fine.
+            pass
+
+        results = find_similar_days(symbol, features)
+        return results
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
+
+@app.get("/predator/journal/{symbol}", dependencies=[Depends(verify_admin_key)])
+async def get_predator_journal(symbol: str):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute("""
+                SELECT * FROM predator_journal 
+                WHERE symbol = %s 
+                ORDER BY created_at DESC
+            """, (symbol,))
+            rows = cur.fetchall()
+            return rows
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
+
+@app.post("/analyze/simulate", dependencies=[Depends(verify_admin_key)])
+async def analyze_simulate(request: SimulationRequest):
+    """
+    (Story 6.5) What-If Simulator.
+    Allows users to override inputs and see how scenario changes.
+    Does NOT persist data.
+    """
+    symbol = request.symbol
+    overrides = request.overrides
+    
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            # Get current features as baseline
+            cur.execute("SELECT * FROM features_gold_serving WHERE symbol = %s ORDER BY effective_date DESC LIMIT 1", (symbol,))
+            latest = cur.fetchone()
+            
+            if not latest:
+                 raise HTTPException(status_code=404, detail="No features found")
+            
+            # Baseline (approximate if not fully calculated here)
+            f_dict = {
+                'hmm_state': latest['hmm_state'],
+                'hype_crowd_z': 0.0, # Default if not calc
+                'hype_elitist_z': (float(latest.get('HunterScore', 50)) - 50.0) / 25.0,
+                'price_change': 0.0,
+                'vol_rel': 1.0
+            }
+            
+            # Apply Overrides
+            for k, v in overrides.items():
+                if k in f_dict:
+                    f_dict[k] = v
+                    
+            # Run Detection
+            scenario_tag = detect_scenario(f_dict)
+            
+            return {
+                "symbol": symbol,
+                "overrides": overrides,
+                "scenario_tag": scenario_tag
+            }
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
 
 
 
@@ -436,11 +748,79 @@ async def get_health_stats():
     try:
         conn = get_db_connection()
         with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            cur.execute("SELECT * FROM macro_clean ORDER BY effective_date DESC LIMIT 100")
-            macro_data = cur.fetchall()
+            # Fetch macro data and transform list to dict {metric_name: {value, last_updated}}
+            cur.execute("SELECT metric_name, value, last_updated FROM macro_clean ORDER BY last_updated DESC")
+            macro_rows = cur.fetchall()
+            # Transform list of rows into a dict for dashboard consumption
+            macro_hub_dict = {
+                row['metric_name']: {
+                    'value': row['value'],
+                    'last_updated': row['last_updated'].isoformat() if row['last_updated'] else None
+                } 
+                for row in macro_rows
+            }
+            
             cur.execute("SELECT * FROM sector_stats ORDER BY as_of_date DESC, sector LIMIT 50")
             sector_data = cur.fetchall()
-            return {"macro_mini_hub": macro_data, "sector_heatmap": sector_data}
+            return {"macro_mini_hub": macro_hub_dict, "sector_heatmap": sector_data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
+
+class MacroUpdatePayload(BaseModel):
+    metrics: Dict[str, float]
+
+@app.post("/admin/macro_update", dependencies=[Depends(verify_admin_key)])
+async def update_macro_stats(payload: MacroUpdatePayload):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            for metric_name, value in payload.metrics.items():
+                cur.execute("""
+                    INSERT INTO macro_clean (metric_name, value, last_updated, effective_date)
+                    VALUES (%s, %s, NOW(), CURRENT_DATE)
+                    ON CONFLICT (metric_name)
+                    DO UPDATE SET 
+                        value = EXCLUDED.value,
+                        last_updated = NOW(),
+                        effective_date = CURRENT_DATE
+                """, (metric_name, value))
+            conn.commit()
+        return {"status": "success", "updated": len(payload.metrics)}
+    except Exception as e:
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
+
+@app.get("/admin/health/sector_rotation", dependencies=[Depends(verify_admin_key)])
+async def get_sector_rotation():
+    """
+    Returns RRG (Relative Rotation Graph) data for sector rotation visualization.
+    Each sub-sector has rs_ratio and rs_momentum for scatter plot.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            # Get latest RRG data for all sub-sectors
+            cur.execute("""
+                SELECT 
+                    sector,
+                    super_sector,
+                    rs_ratio,
+                    rs_momentum,
+                    momentum,
+                    breadth,
+                    as_of_date
+                FROM sector_stats
+                WHERE as_of_date = (SELECT MAX(as_of_date) FROM sector_stats)
+                ORDER BY super_sector, sector
+            """)
+            data = cur.fetchall()
+            return data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:

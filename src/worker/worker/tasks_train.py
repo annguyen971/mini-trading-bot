@@ -23,6 +23,7 @@ from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
 from core_lib.db import get_db_connection
 
 # --- Constants ---
+FORCE_TRAIN = os.getenv("FORCE_TRAIN", "false").lower() == "true" # Force training bypass triggers
 ADVISORY_LOCK_NAME = "train_batch"
 MODEL_VERSION_PREFIX = "lr_"
 
@@ -133,6 +134,10 @@ def check_training_triggers(conn) -> Tuple[bool, List[str]]:
     Returns:
         (should_train, reasons)
     """
+    # Force training flag bypasses all trigger checks
+    if FORCE_TRAIN:
+        return True, ["Force training enabled via FORCE_TRAIN flag"]
+
     reasons = []
 
     with conn.cursor() as cursor:
@@ -483,11 +488,11 @@ def auto_suggest_promotion(conn, new_model_version: str, new_metrics: Dict) -> s
         return 'rejected'
 
     # All guardrails passed
-    print(f"\n Auto-Suggest: READY FOR CANARY")
+    print(f"\n  Auto-Suggest: PENDING BACKTEST (Gatekeeper)")
     print(f"  Sharpe improvement: {sharpe_improvement:.3f}")
     print(f"  Drawdown change: {dd_degradation:.2%}")
 
-    return 'ready_for_canary'
+    return 'pending_backtest'
 
 # --- Main Training Pipeline ---
 

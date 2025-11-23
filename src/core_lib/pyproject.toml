@@ -4,6 +4,8 @@ version = "0.1.0"
 dependencies = [
     "psycopg[binary]",
     "pydantic",
+    "pandas",
+    "numpy",
 ]
 
 [project.optional-dependencies]
