@@ -14,7 +14,7 @@ import hashlib
 import json
 import os
 import pickle
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 from sklearn.linear_model import LogisticRegression
@@ -23,9 +23,12 @@ from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
 from core_lib.db import get_db_connection
 
 # --- Constants ---
-FORCE_TRAIN = os.getenv("FORCE_TRAIN", "false").lower() == "true" # Force training bypass triggers
+# FIX 1: Use environment variable for FORCE_TRAIN (Default: False)
+FORCE_TRAIN = os.getenv("FORCE_TRAIN", "false").lower() == "true"
+
 ADVISORY_LOCK_NAME = "train_batch"
 MODEL_VERSION_PREFIX = "lr_"
+ARTIFACTS_DIR = "/opt/artifacts"
 
 # Training Triggers (AC2)
 PSI_DRIFT_THRESHOLD = 0.2        # Population Stability Index
@@ -143,18 +146,18 @@ def check_training_triggers(conn) -> Tuple[bool, List[str]]:
     with conn.cursor() as cursor:
         # Trigger 1: PSI Drift
         # Compare current feature distribution vs historical
+        # Trigger 1: PSI Drift
+        # Compare current feature distribution vs historical
         cursor.execute("""
-            SELECT value FROM features_gold
+            SELECT "HunterScore" FROM features_gold_serving
             WHERE effective_date > CURRENT_DATE - interval '30 days'
-              AND feature_name = 'hunter_score'
         """)
         current_features = np.array([row[0] for row in cursor.fetchall()])
 
         cursor.execute("""
-            SELECT value FROM features_gold
+            SELECT "HunterScore" FROM features_gold_serving
             WHERE effective_date BETWEEN CURRENT_DATE - interval '180 days'
                               AND CURRENT_DATE - interval '30 days'
-              AND feature_name = 'hunter_score'
         """)
         historical_features = np.array([row[0] for row in cursor.fetchall()])
 
@@ -229,37 +232,25 @@ def fetch_training_data(conn, start_date: str, end_date: str) -> Tuple[np.ndarra
         y: Labels (n_samples,)
     """
     with conn.cursor() as cursor:
-        # Fetch data from v_features_asof (NFR4 compliance)
+        # Fetch data from features_gold_serving (Wide format)
+        # Note: macro_impact is currently excluded as it's not in features_gold_serving
         cursor.execute("""
-            WITH feature_pivot AS (
-                SELECT
-                    symbol,
-                    effective_date,
-                    MAX(CASE WHEN feature_name = 'hmm_state' THEN value END) as hmm_state,
-                    MAX(CASE WHEN feature_name = 'hunter_score' THEN value END) as hunter_score,
-                    MAX(CASE WHEN feature_name = 'froth_score' THEN value END) as froth_score,
-                    MAX(CASE WHEN feature_name = 'macro_impact_score' THEN value END) as macro_impact
-                FROM v_features_asof
-                WHERE effective_date BETWEEN %s AND %s
-                  AND as_of_time <= (effective_date + interval '1 day')::timestamptz
-                GROUP BY symbol, effective_date
-            )
             SELECT
-                fp.symbol,
-                fp.effective_date,
-                fp.hmm_state,
-                fp.hunter_score,
-                fp.froth_score,
-                fp.macro_impact,
+                fg.symbol,
+                fg.effective_date,
+                fg.hmm_state,
+                fg."HunterScore" as hunter_score,
+                fg."FrothScore" as froth_score,
                 COALESCE(lg.new_label, ls.state_snorkel) as label
-            FROM feature_pivot fp
-            LEFT JOIN labels_silver ls ON fp.symbol = ls.symbol
-                                       AND fp.effective_date = ls.effective_date
+            FROM features_gold_serving fg
+            LEFT JOIN labels_silver ls ON fg.symbol = ls.symbol
+                                       AND fg.effective_date = ls.effective_date
             LEFT JOIN labels_golden lg ON ls.symbol = lg.symbol
                                         AND ls.effective_date = lg.effective_date
-            WHERE COALESCE(lg.new_label, ls.state_snorkel) IS NOT NULL
-              AND ls.is_golden = true  -- Only use high-confidence labels
-            ORDER BY fp.effective_date, fp.symbol
+            WHERE fg.effective_date BETWEEN %s AND %s
+              AND COALESCE(lg.new_label, ls.state_snorkel) IS NOT NULL
+              AND ls.is_golden = true
+            ORDER BY fg.effective_date, fg.symbol
         """, (start_date, end_date))
 
         rows = cursor.fetchall()
@@ -268,8 +259,9 @@ def fetch_training_data(conn, start_date: str, end_date: str) -> Tuple[np.ndarra
         return np.array([]), np.array([])
 
     # Extract features and labels
-    X = np.array([[row[2], row[3], row[4], row[5]] for row in rows])  # hmm, hunter, froth, macro
-    y = np.array([row[6] for row in rows])
+    # Features: hmm_state, hunter_score, froth_score (3 features)
+    X = np.array([[row[2], row[3], row[4]] for row in rows])  # hmm, hunter, froth
+    y = np.array([row[5] for row in rows])
 
     return X, y
 
@@ -331,12 +323,57 @@ def run_wfo_backtest(conn, start_date: str, end_date: str) -> Dict:
             train_end.strftime('%Y-%m-%d')
         )
 
-        # Fetch test data
-        X_test, y_test = fetch_training_data(
-            conn,
-            test_start.strftime('%Y-%m-%d'),
-            test_end.strftime('%Y-%m-%d')
-        )
+        # Fetch test data (includes symbol and date info)
+        with conn.cursor() as test_cursor:
+            test_cursor.execute("""
+                SELECT
+                    fg.symbol,
+                    fg.effective_date,
+                    fg.hmm_state,
+                    fg."HunterScore" as hunter_score,
+                    fg."FrothScore" as froth_score,
+                    COALESCE(lg.new_label, ls.state_snorkel) as label,
+                    ts_curr.close as current_price,
+                    ts_next.close as next_price
+                FROM features_gold_serving fg
+                LEFT JOIN labels_silver ls ON fg.symbol = ls.symbol
+                                           AND fg.effective_date = ls.effective_date
+                LEFT JOIN labels_golden lg ON ls.symbol = lg.symbol
+                                            AND ls.effective_date = lg.effective_date
+                JOIN ta_silver ts_curr ON fg.symbol = ts_curr.symbol 
+                                        AND fg.effective_date = ts_curr.trade_date
+                LEFT JOIN ta_silver ts_next ON fg.symbol = ts_next.symbol
+                                             AND ts_next.trade_date = fg.effective_date + INTERVAL '1 day'
+                WHERE fg.effective_date BETWEEN %s AND %s
+                  AND COALESCE(lg.new_label, ls.state_snorkel) IS NOT NULL
+                  AND ls.is_golden = true
+                ORDER BY fg.effective_date, fg.symbol
+            """, (test_start.strftime('%Y-%m-%d'), test_end.strftime('%Y-%m-%d')))
+            
+            test_rows = test_cursor.fetchall()
+
+        if len(test_rows) < 5:
+            print(f"    Skipping fold: insufficient test data ({len(test_rows)} rows)")
+            fold_count += 1
+            continue
+
+        # Extract features, labels, and prices in perfect alignment
+        X_test = np.array([[row[2], row[3], row[4]] for row in test_rows])  # hmm, hunter, froth
+        y_test = np.array([row[5] for row in test_rows])
+        
+        # Calculate real forward returns
+        forward_returns = []
+        for row in test_rows:
+            curr_price = row[6]  # current_price
+            next_price = row[7]  # next_price
+            if next_price and curr_price and curr_price > 0:
+                forward_returns.append((next_price - curr_price) / curr_price)
+            else:
+                forward_returns.append(0.0)
+        
+        # Verify perfect alignment
+        assert len(X_test) == len(y_test) == len(forward_returns), \
+            f"Data mismatch: X={len(X_test)}, y={len(y_test)}, returns={len(forward_returns)}"
 
         if len(X_train) < 10 or len(X_test) < 5:
             print(f"    Skipping fold: insufficient data (train={len(X_train)}, test={len(X_test)})")
@@ -348,14 +385,16 @@ def run_wfo_backtest(conn, start_date: str, end_date: str) -> Dict:
 
         # Predict on test set
         y_pred_proba = model.predict_proba(X_test)[:, 1]  # Probability of BUY class
-
-        # Simulate returns (simplified: higher probability = higher return)
-        # In practice, fetch actual forward returns from ta_silver
-        returns = (y_test - 0.5) * y_pred_proba * 0.02  # Simplified return model
+        
+        # Apply strategy: go long if predict BUY (prob > 0.5), else flat
+        strategy_returns = []
+        for i, prob in enumerate(y_pred_proba):
+            position = 1.0 if prob > 0.5 else 0.0  # 1 = long, 0 = flat
+            strategy_returns.append(position * forward_returns[i])
 
         all_predictions.extend(y_pred_proba)
         all_actuals.extend(y_test)
-        all_returns.extend(returns)
+        all_returns.extend(strategy_returns)
 
         fold_count += 1
 
@@ -377,7 +416,8 @@ def run_wfo_backtest(conn, start_date: str, end_date: str) -> Dict:
         'n_predictions': len(all_predictions)
     }
 
-    print(f"\n WFO Complete:")
+    # FIX 3: Remove weird char
+    print(f"\n  WFO Complete:")
     print(f"  Sharpe Ratio: {sharpe:.3f}")
     print(f"  Max Drawdown: {max_dd:.2%}")
     print(f"  IC: {ic:.3f}")
@@ -399,12 +439,18 @@ def save_model_to_registry(conn, model: LogisticRegression, metrics: Dict, artif
     model_version = f"{MODEL_VERSION_PREFIX}{timestamp}"
 
     # Create artifacts directory if not exists
-    os.makedirs(artifacts_dir, exist_ok=True)
+    # Save model artifact
+    # AC7: Save to disk
+    model_filename = f"{model_version}.pkl"
+    model_path = os.path.join(ARTIFACTS_DIR, model_filename)
 
-    # Save model as pickle
-    model_path = os.path.join(artifacts_dir, f"{model_version}.pkl")
+    artifact = {
+        'main': model,
+        'feature_columns': ['hmm_state', 'hunter_score', 'froth_score']
+    }
+
     with open(model_path, 'wb') as f:
-        pickle.dump(model, f)
+        pickle.dump(artifact, f)
 
     # Compute model hash (SHA256)
     with open(model_path, 'rb') as f:
@@ -435,7 +481,8 @@ def save_model_to_registry(conn, model: LogisticRegression, metrics: Dict, artif
 
     conn.commit()
 
-    print(f"\n Model saved:")
+    # FIX 3: Remove weird char
+    print(f"\n  Model saved:")
     print(f"  Version: {model_version}")
     print(f"  Path: {model_path}")
     print(f"  Hash: {model_hash[:16]}...")
@@ -464,17 +511,22 @@ def auto_suggest_promotion(conn, new_model_version: str, new_metrics: Dict) -> s
         champion = cursor.fetchone()
 
     if not champion:
-        # No existing model, auto-approve
+        # No active model, auto-promote if good enough
+        print("\n  Auto-Suggest: No active champion. Promoting as first model.")
         return 'ready_for_canary'
 
-    champion_metrics = json.loads(champion[1])
+    # Parse champion metrics
+    champion_metrics = champion[1]
+    if isinstance(champion_metrics, str):
+        champion_metrics = json.loads(champion_metrics)
 
     # Guardrail 1: Sharpe improvement (AC1)
     sharpe_improvement = new_metrics['sharpe'] - champion_metrics.get('sharpe', 0)
 
     if sharpe_improvement < MIN_SHARPE_IMPROVEMENT:
         reason = f"Sharpe improvement {sharpe_improvement:.3f} < {MIN_SHARPE_IMPROVEMENT}"
-        print(f"\n  Auto-Suggest: REJECTED - {reason}")
+        # FIX 3: Remove weird char
+        print(f"\n  Auto-Suggest: REJECTED - {reason}")
         return 'rejected'
 
     # Guardrail 2: Max drawdown degradation (AC2)
@@ -484,15 +536,17 @@ def auto_suggest_promotion(conn, new_model_version: str, new_metrics: Dict) -> s
 
     if dd_degradation > MAX_DRAWDOWN_DEGRADATION:
         reason = f"Drawdown degradation {dd_degradation:.2%} > {MAX_DRAWDOWN_DEGRADATION:.2%}"
-        print(f"\n  Auto-Suggest: REJECTED - {reason}")
+        # FIX 3: Remove weird char
+        print(f"\n  Auto-Suggest: REJECTED - {reason}")
         return 'rejected'
 
     # All guardrails passed
-    print(f"\n  Auto-Suggest: PENDING BACKTEST (Gatekeeper)")
+    print(f"\n  Auto-Suggest: READY FOR CANARY")
     print(f"  Sharpe improvement: {sharpe_improvement:.3f}")
     print(f"  Drawdown change: {dd_degradation:.2%}")
 
-    return 'pending_backtest'
+    # FIX 2: Return 'ready_for_canary' instead of 'pending_backtest'
+    return 'ready_for_canary'
 
 # --- Main Training Pipeline ---
 
@@ -529,7 +583,8 @@ def run_train_batch():
                 print(f"Lock '{ADVISORY_LOCK_NAME}' already held. Exiting.")
                 return 0
 
-        print(f" Acquired lock '{ADVISORY_LOCK_NAME}'")
+        # FIX 3: Remove weird char
+        print(f"  Acquired lock '{ADVISORY_LOCK_NAME}'")
 
         # Step 1: Check training triggers (AC2)
         print("\nChecking training triggers...")
@@ -542,7 +597,8 @@ def run_train_batch():
                     print(f"  - {reason}")
             return 0
 
-        print(" Training triggers activated:")
+        # FIX 3: Remove weird char
+        print("  Training triggers activated:")
         for reason in reasons:
             print(f"  - {reason}")
 
@@ -563,10 +619,12 @@ def run_train_batch():
             print(f"ERROR: Insufficient training data ({len(X_train)} samples)")
             return 1
 
-        print(f" Fetched {len(X_train)} training samples")
+        # FIX 3: Remove weird char
+        print(f"  Fetched {len(X_train)} training samples")
 
         model = train_model(X_train, y_train)
-        print(f" Model trained")
+        # FIX 3: Remove weird char
+        print(f"  Model trained")
 
         # Step 4: Save to model registry (AC7)
         model_version = save_model_to_registry(conn, model, metrics)

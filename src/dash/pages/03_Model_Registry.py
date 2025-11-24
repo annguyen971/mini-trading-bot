@@ -50,8 +50,8 @@ models_data = get_models()
 
 if models_data:
     df = pd.DataFrame(models_data)
-    # Improve display
-    st.dataframe(df.style.highlight_max(axis=0, subset=['metrics'], props='color:lightgreen;'))
+    # Display dataframe without highlighting (metrics column contains dicts)
+    st.dataframe(df, use_container_width=True)
 
     st.header("Actions")
     selected_model = st.selectbox(

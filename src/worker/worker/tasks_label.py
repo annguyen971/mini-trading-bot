@@ -284,14 +284,12 @@ def fetch_features_for_labeling(conn, as_of_date: str) -> List[Dict]:
             SELECT
                 symbol,
                 effective_date,
-                MAX(CASE WHEN feature_name = 'hmm_state' THEN value END) as hmm_state,
-                MAX(CASE WHEN feature_name = 'hunter_score' THEN value END) as hunter_score,
-                MAX(CASE WHEN feature_name = 'froth_score' THEN value END) as froth_score,
-                MAX(CASE WHEN feature_name = 'macro_impact_score' THEN value END) as macro_impact_score
-            FROM features_gold
+                hmm_state,
+                "HunterScore" as hunter_score,
+                "FrothScore" as froth_score,
+                NULL as macro_impact_score
+            FROM features_gold_serving
             WHERE effective_date = %s
-            GROUP BY symbol, effective_date
-            HAVING COUNT(*) >= 4  -- Ensure all features present
         """, (as_of_date,))
 
         rows = cursor.fetchall()
@@ -527,7 +525,7 @@ def inject_honeypots(labels_data: List[Dict], honeypot_rate: float = 0.05) -> Li
 
 # --- Main Label Batch ---
 
-def run_label_batch():
+def run_label_batch(target_date: Optional[str] = None):
     """
     Main entrypoint for label_batch job.
 
@@ -562,10 +560,17 @@ def run_label_batch():
                 print(f"Lock '{ADVISORY_LOCK_NAME}' already held. Exiting.")
                 return 0
 
-        print(f" Acquired lock '{ADVISORY_LOCK_NAME}'")
+        print(f"  Acquired lock '{ADVISORY_LOCK_NAME}'")
 
-        # Determine as_of_date (previous day - assume features_gold ran yesterday)
-        as_of_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        # Determine as_of_date
+        if target_date:
+            as_of_date = target_date
+        else:
+            env_date = os.getenv("AS_OF_DATE")
+            if env_date:
+                as_of_date = env_date
+            else:
+                as_of_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
         # Step 1: Fetch features
         print(f"\nFetching features for {as_of_date}...")

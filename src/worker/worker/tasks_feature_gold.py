@@ -462,6 +462,7 @@ def calculate_scores(df: pl.DataFrame, conn, enable_blend: bool) -> pl.DataFrame
             df = df.with_columns(pl.lit(0.5).alias(col))
 
 
+
     # FrothScore (same as before)
     df = df.with_columns(S_crowd=pl.max_horizontal(0, pl.col('hype_crowd_z')))
     df = df.with_columns(
@@ -577,6 +578,67 @@ def atomic_publish(conn, df: pl.DataFrame, version: str):
         raise
 
 
+def calculate_sentiment_features(conn) -> pl.DataFrame:
+    """Calculate sentiment Z-scores from sa_silver."""
+    logger.info("Calculating sentiment features from sa_silver...")
+    query = """
+    SELECT 
+        unnest(symbols) as symbol,
+        date(publisher_time_utc) as effective_date,
+        sentiment_score,
+        hype_raw
+    FROM sa_silver
+    WHERE sentiment_score IS NOT NULL
+    """
+    sa_df = read_sql_pl(query, params=None)
+    
+    if sa_df.height == 0:
+        return pl.DataFrame(
+            {"symbol": [], "effective_date": [], "hype_crowd_z": [], "news_count_crowd_z": []},
+            schema={"symbol": pl.String, "effective_date": pl.Date, "hype_crowd_z": pl.Float64, "news_count_crowd_z": pl.Float64}
+        )
+
+    # Calculate daily aggregates
+    daily_sa = sa_df.group_by(["symbol", "effective_date"]).agg([
+        pl.col("hype_raw").mean().alias("daily_hype"),
+        pl.count("sentiment_score").alias("news_count")
+    ])
+    
+    daily_sa = daily_sa.sort(["symbol", "effective_date"])
+    
+    # Rolling window 20 days
+    daily_sa = daily_sa.with_columns([
+        ((pl.col("daily_hype") - pl.col("daily_hype").rolling_mean(20).over("symbol")) / 
+        (pl.col("daily_hype").rolling_std(20).over("symbol") + 1e-6)).alias("hype_crowd_z"),
+        
+        ((pl.col("news_count") - pl.col("news_count").rolling_mean(20).over("symbol")) / 
+        (pl.col("news_count").rolling_std(20).over("symbol") + 1e-6)).alias("news_count_crowd_z")
+    ])
+    
+    return daily_sa.select(["symbol", "effective_date", "hype_crowd_z", "news_count_crowd_z"]).fill_null(0.0)
+
+def calculate_technical_features(conn) -> pl.DataFrame:
+    """Calculate technical Z-scores from ta_silver."""
+    logger.info("Calculating technical features from ta_silver...")
+    query = """
+    SELECT symbol, trade_date as effective_date, close FROM ta_silver
+    """
+    ta_df = read_sql_pl(query, params=None)
+    ta_df = ta_df.sort(["symbol", "effective_date"])
+    
+    # Calculate Returns
+    ta_df = ta_df.with_columns([
+        pl.col("close").pct_change().over("symbol").alias("returns")
+    ])
+    
+    # Calculate S_tech_z (Return Z-score)
+    ta_df = ta_df.with_columns([
+        ((pl.col("returns") - pl.col("returns").rolling_mean(20).over("symbol")) / 
+        (pl.col("returns").rolling_std(20).over("symbol") + 1e-6)).alias("S_tech_z")
+    ])
+    
+    return ta_df.select(["symbol", "effective_date", "S_tech_z"]).fill_null(0.0)
+
 def run_feature_gold_batch():
     lock_name = 'feature_gold_batch'
     with pg_conn() as conn:
@@ -590,7 +652,11 @@ def run_feature_gold_batch():
             MACRO_TZ_STR = os.getenv("MACRO_TZ", "Asia/Ho_Chi_Minh")
 
             # (Point 5) Use timezone-aware date
-            as_of_date = datetime.now(pytz.timezone(MACRO_TZ_STR)).date()
+            env_date = os.getenv("AS_OF_DATE")
+            if env_date:
+                as_of_date = datetime.strptime(env_date, '%Y-%m-%d').date()
+            else:
+                as_of_date = datetime.now(pytz.timezone(MACRO_TZ_STR)).date()
 
             start_time = time.time()
             # This is called but the main logic inside is commented out until prerequisite tables exist.
@@ -606,9 +672,36 @@ def run_feature_gold_batch():
             calculate_breadth_stats(conn, as_of_date)
             logger.info(f"Sector stats calculation finished in {time.time() - start_time:.2f}s")
 
+
+
             # The view v_features_asof does not exist, so this will fail.
             # Using a placeholder query for now.
             df = read_sql_pl("SELECT * FROM v_features_asof", params=None)
+            
+            # --- NEW: Calculate Real Features ---
+            # Calculate features from raw data to replace constant 0.5s from view
+            sent_df = calculate_sentiment_features(conn)
+            tech_df = calculate_technical_features(conn)
+            
+            # Ensure date types match
+            df = df.with_columns(pl.col("effective_date").cast(pl.Date))
+            sent_df = sent_df.with_columns(pl.col("effective_date").cast(pl.Date))
+            tech_df = tech_df.with_columns(pl.col("effective_date").cast(pl.Date))
+            
+            # Drop dummy columns from view
+            cols_to_drop = ['hype_crowd_z', 'news_count_crowd_z', 's_tech_z', 'S_tech_z']
+            df = df.drop([c for c in cols_to_drop if c in df.columns])
+            
+            # Join real features
+            df = df.join(sent_df, on=["symbol", "effective_date"], how="left")
+            df = df.join(tech_df, on=["symbol", "effective_date"], how="left")
+            
+            # Fill missing values with neutral 0.0
+            df = df.with_columns([
+                pl.col("hype_crowd_z").fill_null(0.0),
+                pl.col("news_count_crowd_z").fill_null(0.0),
+                pl.col("S_tech_z").fill_null(0.0)
+            ])
 
             df = apply_hmm(df)
             df = calculate_scores(df, conn, ENABLE_MACRO_BLEND)

@@ -222,7 +222,7 @@ def apply_sa_sanity_rules(payload: dict) -> Tuple[bool, Optional[str], Optional[
                 return False, 'sa_rule_7_symbol_invalid', f'Invalid symbol in array: {sym}'
 
     # Rule 8: Domain validation
-    source_domain = payload.get('source_domain', '') or payload.get('source_name', '')
+    source_domain = payload.get('source_domain', '') or payload.get('source_name', '') or payload.get('source', '')
     if not source_domain:
         # Try to extract from URL
         try:
@@ -292,7 +292,7 @@ def upsert_sa_silver(conn, payload: dict):
     with conn.cursor() as cursor:
         # Map payload keys to match sa_silver schema
         url_canonical = payload.get('url_canonical') or payload.get('url')
-        source_name = payload.get('source_domain') or payload.get('source_name')
+        source_name = payload.get('source_domain') or payload.get('source_name') or payload.get('source')
         publisher_time_utc = payload.get('publisher_time_utc') or payload.get('publisher_time')
         as_of_time = payload.get('as_of_time', datetime.now())
         text_norm_hash = payload.get('content_hash') or payload.get('text_norm_hash')

@@ -7,4 +7,5 @@ dependencies = [
     "core-lib @ file://../core_lib",
     "vnstock",
     "pandas",
+    "google-genai"
 ]

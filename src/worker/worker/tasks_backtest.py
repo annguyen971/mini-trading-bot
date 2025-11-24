@@ -8,7 +8,8 @@ import pickle
 from datetime import datetime, timezone
 
 # Assuming core_lib provides these helpers
-from core_lib.db import get_db_connection, advisory_lock
+from core_lib.db import get_db_connection
+from core_lib.locks import get_advisory_lock
 
 # --- Constants ---
 ARTIFACTS_DIR = "/opt/artifacts"
@@ -38,14 +39,21 @@ def get_champion_challenger_models():
             if not champion or not challenger:
                 return None, None
 
-            return (champion[0], json.loads(champion[1]) if champion[1] else None), \
-                   (challenger[0], json.loads(challenger[1]) if challenger[1] else None)
+            champion_metrics = champion[1]
+            if isinstance(champion_metrics, str):
+                champion_metrics = json.loads(champion_metrics)
+
+            challenger_metrics = challenger[1]
+            if isinstance(challenger_metrics, str):
+                challenger_metrics = json.loads(challenger_metrics)
+
+            return (champion[0], champion_metrics), (challenger[0], challenger_metrics)
 
 
 import numpy as np
 import pandas as pd
 import vectorbt as vbt
-from core_lib.utils import load_config
+# from core_lib.utils import load_config
 import signal
 
 # --- Timeout Handler for Compute Budget ---
@@ -68,17 +76,26 @@ def load_backtest_data_and_model(challenger_version, symbol_cap=100):
     print(f"Loading backtest feature and price data (capped at {symbol_cap} symbols)...")
     with get_db_connection() as conn:
         # Load all historical features and prices for the selected symbols
+        # Load all historical features and prices for the selected symbols
+        # Join features_gold_serving with ta_silver to get price
         sql = f"""
             WITH top_symbols AS (
-                SELECT symbol FROM v_features_asof GROUP BY symbol ORDER BY COUNT(*) DESC LIMIT {symbol_cap}
+                SELECT symbol FROM features_gold_serving GROUP BY symbol ORDER BY COUNT(*) DESC LIMIT {symbol_cap}
             )
-            SELECT symbol, effective_date, price_close, {', '.join(challenger_artifact['feature_columns'])}
-            FROM v_features_asof
-            WHERE symbol IN (SELECT symbol FROM top_symbols);
+            SELECT
+                fg.symbol,
+                fg.effective_date,
+                ts.close as price_close,
+                fg.hmm_state,
+                fg."HunterScore" as hunter_score,
+                fg."FrothScore" as froth_score
+            FROM features_gold_serving fg
+            JOIN ta_silver ts ON fg.symbol = ts.symbol AND fg.effective_date = ts.trade_date
+            WHERE fg.symbol IN (SELECT symbol FROM top_symbols);
         """
         df = pd.read_sql(sql, conn, index_col=['effective_date', 'symbol'])
 
-    price_df = df['price_close'].unstack()
+    price_df = df['price_close'].unstack().astype(float)
     feature_df = df[challenger_artifact['feature_columns']]
 
     return challenger_artifact, price_df, feature_df
@@ -98,7 +115,11 @@ def run_wfo_backtest(champion_version, challenger_version):
     Runs a real WFO backtest using vectorbt, respecting compute budget.
     """
     print(f"Running WFO backtest: '{champion_version}' vs '{challenger_version}'...")
-    config = load_config().get('backtest', {})
+    # config = load_config().get('backtest', {})
+    config = {
+        'wallclock_limit_minutes': 30,
+        'symbol_cap': 100
+    }
 
     wallclock_limit_seconds = config.get('wallclock_limit_minutes', 30) * 60
     signal.signal(signal.SIGALRM, timeout_handler)
@@ -111,20 +132,68 @@ def run_wfo_backtest(champion_version, challenger_version):
 
         # Generate signals using the challenger model
         entries, exits = generate_signals(challenger_artifact['main'], feature_df)
-        entries = entries.unstack()
-        exits = exits.unstack()
+        entries = entries.unstack().fillna(False).astype(bool)
+        exits = exits.unstack().fillna(False).astype(bool)
+        
+        # Ensure price is float and fill NaNs (forward fill then backward fill)
+        price_df = price_df.ffill().bfill().astype(float)
 
-        n_folds = 12
-        in_out_chunks = vbt.wfo_split(price_df.index, n_folds, in_len='180D', out_len='30D')
-        pf = vbt.Portfolio.from_signals(price_df, entries, exits, freq='D', init_cash=100000)
-        wfo_pf = pf.wfo(in_out_chunks)
+        # Manual WFO Loop
+        start_dt = price_df.index.min()
+        end_dt = price_df.index.max()
+        
+        # WFO Parameters (matching tasks_train.py)
+        WFO_TRAIN_WINDOW_DAYS = 180
+        WFO_TEST_WINDOW_DAYS = 30
+        WFO_STEP_DAYS = 30
+        
+        fold_count = 0
+        all_stats = []
+        
+        current_start = start_dt
+        
+        while True:
+            train_end = current_start + pd.Timedelta(days=WFO_TRAIN_WINDOW_DAYS)
+            test_start = train_end + pd.Timedelta(days=1)
+            test_end = test_start + pd.Timedelta(days=WFO_TEST_WINDOW_DAYS)
+            
+            if test_end > end_dt:
+                break
+                
+            # Slice data for test period (OOS)
+            mask = (price_df.index >= test_start) & (price_df.index <= test_end)
+            if not mask.any():
+                break
+                
+            fold_price = price_df[mask]
+            fold_entries = entries[mask]
+            fold_exits = exits[mask]
+            
+            if fold_price.empty:
+                break
 
-        stats = wfo_pf.stats()
+            # Run Backtest for this fold
+            pf = vbt.Portfolio.from_signals(fold_price, fold_entries, fold_exits, freq='D', init_cash=100000)
+            fold_stats = pf.stats()
+            all_stats.append(fold_stats)
+            
+            current_start += pd.Timedelta(days=WFO_STEP_DAYS)
+            fold_count += 1
+            
+        if not all_stats:
+             print("No WFO folds completed.")
+             return {'sharpe_elitist': 0.0, 'max_drawdown': 0.0, 'oos_trades': 0}
+
+        # Aggregate stats (average Sharpe, worst DD)
+        avg_sharpe = np.mean([s['Sharpe Ratio'] for s in all_stats])
+        worst_dd = np.min([s['Max Drawdown [%]'] for s in all_stats]) / 100
+        total_trades = np.sum([s['Total Trades'] for s in all_stats])
+
         challenger_metrics = {
-            "sharpe_elitist": round(stats['Sharpe Ratio'], 3),
-            "sharpe_baseline": round(stats['Sharpe Ratio'] * 0.9, 3),
-            "max_drawdown": round(stats['Max Drawdown [%]'] / 100, 3),
-            "oos_trades": int(stats['Total Trades']),
+            "sharpe_elitist": round(avg_sharpe, 3),
+            "sharpe_baseline": round(avg_sharpe * 0.9, 3),
+            "max_drawdown": round(worst_dd, 3),
+            "oos_trades": int(total_trades),
             "ci_95_diff": [0.01, 0.05]
         }
         print(f"Backtest complete. Results: {challenger_metrics}")
@@ -206,9 +275,10 @@ def main():
     """Main execution function."""
     print(f"--- Running backtest_batch at {datetime.now(timezone.utc)} ---")
 
-    with advisory_lock('backtest_batch') as locked:
-        if not locked:
-            print("Could not acquire lock 'backtest_batch'. Exiting.")
+    with get_db_connection() as conn:
+        # 1. Acquire Lock
+        if not get_advisory_lock(conn, "backtest_worker"):
+            print("Could not acquire lock. Exiting.")
             return 1
 
         champion, challenger = get_champion_challenger_models()

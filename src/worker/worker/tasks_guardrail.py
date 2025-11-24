@@ -12,7 +12,7 @@ import os
 import json
 from datetime import datetime
 from typing import Dict, List, Optional
-import psycopg2
+# import psycopg2
 from core_lib.db import get_db_connection
 
 # --- Constants ---
