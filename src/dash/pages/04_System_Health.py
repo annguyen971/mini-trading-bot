@@ -156,13 +156,22 @@ if health_data:
                 # Sort by date to ensure trails are drawn correctly
                 df['as_of_date'] = pd.to_datetime(df['as_of_date'])
                 df = df.sort_values(['sector', 'as_of_date'])
+
+                # FIX P0: Filter out invalid points (None, NaN, 0, or raw Z-scores near 0)
+                # Valid RRG values should be around 100. We filter out anything < 10 to be safe.
+                df = df.dropna(subset=['rs_ratio', 'rs_momentum'])
+                df = df[(df['rs_ratio'] > 10) & (df['rs_momentum'] > 10)]
                 
                 # Get latest data for markers and labels
+                if df.empty:
+                    st.warning("No valid RRG data found after filtering.")
+                    st.stop()
+
                 latest_date = df['as_of_date'].max()
                 df_latest = df[df['as_of_date'] == latest_date].copy()
                 
                 # 2. Calculate Symmetric Range (Strict Square)
-                # Find max deviation from 100 across all data points (including history)
+                # Find max deviation from 100 across all VALID data points (including history)
                 max_dev_x = max(abs(df['rs_ratio'].max() - 100), abs(df['rs_ratio'].min() - 100))
                 max_dev_y = max(abs(df['rs_momentum'].max() - 100), abs(df['rs_momentum'].min() - 100))
                 limit = max(max_dev_x, max_dev_y, 10.0) * 1.1 # Min 10.0 deviation, 10% buffer
@@ -173,10 +182,18 @@ if health_data:
                 # 3. Create Figure
                 fig = go.Figure()
                 
-                # Define colors for Super Sectors
+                # Define distinct colors for Super Sectors (manually for better visibility)
+                # Avoid similar colors that are hard to distinguish
+                SUPER_SECTOR_COLORS = {
+                    'Production_Export': '#E74C3C',    # Red
+                    'Financials': '#F39C12',           # Orange/Gold
+                    'Real_Estate_Chain': '#27AE60',    # Green
+                    'Consumer_Tech': '#3498DB',        # Blue
+                    'Utilities': '#9B59B6'             # Purple
+                }
+                
                 super_sectors = df['super_sector'].unique()
-                palette = sns.color_palette("husl", len(super_sectors)).as_hex()
-                color_map = {sector: color for sector, color in zip(super_sectors, palette)}
+                color_map = {sector: SUPER_SECTOR_COLORS.get(sector, '#95A5A6') for sector in super_sectors}
                 
                 # 4. Draw Trails (History)
                 for sector in df['sector'].unique():
@@ -189,9 +206,10 @@ if health_data:
                             x=sector_df['rs_ratio'],
                             y=sector_df['rs_momentum'],
                             mode='lines',
-                            line=dict(color=color, width=1, dash='dot'), # Thinner, dotted lines for trails
+                            line=dict(color=color, width=1, dash='dot'),
                             opacity=0.5,
                             showlegend=False,
+                            legendgroup=super_sec,  # Link to super_sector legend
                             hoverinfo='skip'
                         ))
 
@@ -208,43 +226,45 @@ if health_data:
                         text=sec_df['sector'],
                         textposition='top center',
                         name=super_sec,
+                        legendgroup=super_sec,  # Group all traces for this super_sector
                         customdata=sec_df[['sector', 'breadth', 'concentration', 'turnover_shock_z']],
                         hovertemplate="<b>%{text}</b><br>Ratio: %{x:.2f}<br>Mom: %{y:.2f}<br>Breadth: %{customdata[1]:.2f}<br>Conc: %{customdata[2]:.2f}<br>Shock: %{customdata[3]:.2f}<extra></extra>"
                     ))
                     
-                    # 6. Smart Annotations (Updated Logic)
-                    # TRỤ KÉO (Pillar Pull): Conc > 0.6 & Breadth < 0.3
-                    # LAN TỎA THẬT (True Broad Rally): Breadth > 0.7 & Conc < 0.4
-                    # LAN TỎA (Broad Rally): Breadth > 0.7 & Mom > 100 (Secondary)
-                    # TIỀN VÀO (Money In): Shock > 1.5
+                    # 6. Smart Annotations (Backend Driven) - using invisible scatter traces for legend interactivity
+                    TAG_MAP = {
+                        'TRU_KEO': '⚠️ TRỤ KÉO',
+                        'LAN_TOA_THAT': '🌊 LAN TỎA THẬT',
+                        'LAN_TOA': '🌊 LAN TỎA',
+                        'TIEN_VAO': '🔥 TIỀN VÀO',
+                        'SAMPLE_NHO': '⚠️ MẪU NHỎ'
+                    }
                     
+                    # Collect annotation data for this super_sector
+                    annot_x, annot_y, annot_text = [], [], []
                     for idx, row in sec_df.iterrows():
-                        alerts = []
-                        breadth = row.get('breadth', 0)
-                        conc = row.get('concentration', 0)
-                        shock = row.get('turnover_shock_z', 0)
-                        mom = row['rs_momentum']
+                        tags = row.get('tags') or []
+                        if not isinstance(tags, list): tags = []
                         
-                        if conc > 0.6 and breadth < 0.3:
-                            alerts.append("TRỤ KÉO")
-                        elif breadth > 0.7 and conc < 0.4:
-                            alerts.append("LAN TỎA THẬT")
-                        elif breadth > 0.7 and mom > 100:
-                            alerts.append("LAN TỎA")
-                            
-                        if shock > 1.5:
-                            alerts.append("TIỀN VÀO")
-                            
+                        alerts = [TAG_MAP.get(t, t) for t in tags if t in TAG_MAP and t != 'SAMPLE_NHO']
                         if alerts:
                             alert_text = " | ".join(alerts)
-                            fig.add_annotation(
-                                x=row['rs_ratio'],
-                                y=row['rs_momentum'],
-                                text=f"<span style='color:red; font-size:10px'><b>{alert_text}</b></span>",
-                                showarrow=True,
-                                arrowhead=1,
-                                yshift=-20 # Shift below the marker
-                            )
+                            annot_x.append(row['rs_ratio'])
+                            annot_y.append(row['rs_momentum'] - 5)  # Offset below marker
+                            annot_text.append(f"<b>{alert_text}</b>")
+                    
+                    # Add as invisible scatter trace linked to legend
+                    if annot_x:
+                        fig.add_trace(go.Scatter(
+                            x=annot_x,
+                            y=annot_y,
+                            mode='text',
+                            text=annot_text,
+                            textfont=dict(size=10, color='red'),
+                            showlegend=False,
+                            legendgroup=super_sec,  # Link to super_sector legend
+                            hoverinfo='skip'
+                        ))
 
                 # 7. Layout & Quadrants (P0: Strict Square & Center 100)
                 fig.update_layout(
@@ -292,58 +312,84 @@ if health_data:
 
                 # Debug Log
                 if 'df_latest' in locals() and not df_latest.empty:
-                    st.caption(f"Debug: Loaded {len(df_latest)} rows for Market X-Ray.")
-                    
                     # 1. Use Latest Data
                     xray_df = df_latest.copy()
                     
                     # 2. Ensure Columns Exist (Fix lỗi thiếu cột)
-                    required_cols = ['concentration', 'breadth', 'turnover_shock_z', 'rs_ratio', 'sector']
+                    # 2. Ensure Columns Exist (Fix lỗi thiếu cột)
+                    required_cols = ['concentration', 'breadth', 'turnover_shock_z', 'rs_ratio', 'sector', 'tags', 'breadth_n', 'sector_n', 'confidence', 'top_contributors', 'super_sector']
                     for col in required_cols:
                         if col not in xray_df.columns:
-                            xray_df[col] = 0.0 # Fill default
+                            if col == 'tags': xray_df[col] = [[] for _ in range(len(xray_df))]
+                            else: xray_df[col] = None if col == 'top_contributors' else 0.0 # Fill default
                             
-                    # 3. Diagnose Logic
+                    # 3. Diagnose Logic (Backend Driven)
                     def diagnose(row):
-                        conc = float(row.get('concentration', 0) or 0)
-                        breadth = float(row.get('breadth', 0) or 0)
-                        shock = float(row.get('turnover_shock_z', 0) or 0)
-                        ratio = float(row.get('rs_ratio', 100))
+                        tags = row.get('tags') or []
+                        if not isinstance(tags, list): tags = []
                         
-                        alerts = []
-                        # Logic Trụ Kéo
-                        if ratio > 100 and conc > 0.6 and breadth < 0.3:
-                            alerts.append("⚠️ TRỤ KÉO")
-                        # Logic Lan Tỏa
-                        if ratio > 100 and breadth > 0.7:
-                            alerts.append("🌊 LAN TỎA")
-                        # Logic Tiền Vào
-                        if shock > 1.5:
-                            alerts.append("🔥 TIỀN VÀO")
+                        alerts = [TAG_MAP.get(t, t) for t in tags if t in TAG_MAP]
+                        
+                        # Add Sample Size Warning
+                        if 'SAMPLE_NHO' in tags:
+                            sec_n = int(row.get('sector_n', 0))
+                            alerts.append(f"⚠️ Mẫu nhỏ ({sec_n} mã)")
                             
                         return ", ".join(alerts) if alerts else "Bình thường"
 
                     xray_df['Chẩn đoán'] = xray_df.apply(diagnose, axis=1)
                     
+                    # P0: Format Confidence
+                    xray_df['Độ tin cậy'] = xray_df['confidence'].apply(lambda x: f"{x:.0%}")
+                    
+                    # Format Top Contributors (add % symbol)
+                    def prettify_top_contributors(raw: str) -> str:
+                        if not raw or pd.isna(raw):
+                            return "-"
+                        try:
+                            parts = []
+                            for item in raw.split(", "):
+                                sym, val = item.split(":")
+                                parts.append(f"{sym} ({float(val):.1f}%)")
+                            return ", ".join(parts)
+                        except:
+                            return str(raw)
+                    
+                    xray_df['🔥 Top dẫn dắt'] = xray_df['top_contributors'].apply(prettify_top_contributors)
+                    
                     # 4. Display Table (Chọn cột hiển thị)
-                    display_cols = ['sector', 'rs_ratio', 'rs_momentum', 'breadth', 'concentration', 'turnover_shock_z', 'Chẩn đoán']
+                    display_cols = ['sector', 'super_sector', 'rs_ratio', 'rs_momentum', 'breadth', 'concentration', 'turnover_shock_z', 'Độ tin cậy', '🔥 Top dẫn dắt', 'Chẩn đoán']
                     
                     # Format Style
                     def color_row(row):
                         val = row['Chẩn đoán']
-                        if "TRỤ KÉO" in val: return ['background-color: #ffebee'] * len(row)
-                        if "LAN TỎA" in val: return ['background-color: #e8f5e9'] * len(row)
-                        if "TIỀN VÀO" in val: return ['background-color: #fffde7'] * len(row)
-                        return [''] * len(row)
+                        styles = [''] * len(row)
+                        
+                        if "TRỤ KÉO" in val: styles = ['background-color: #ffebee'] * len(row)
+                        elif "LAN TỎA" in val: styles = ['background-color: #e8f5e9'] * len(row)
+                        elif "TIỀN VÀO" in val: styles = ['background-color: #fffde7'] * len(row)
+                        
+                        # Grey out if confidence is low
+                        conf = float(str(row['Độ tin cậy']).strip('%')) / 100.0
+                        if conf < 0.5:
+                            styles = ['color: #757575; font-style: italic'] * len(row)
+                            
+                        return styles
+
+                    # Safe Format Function
+                    def safe_format(val, fmt):
+                        if val is None: return "-"
+                        try: return fmt.format(val)
+                        except: return str(val)
 
                     st.dataframe(
                         xray_df[display_cols].style.apply(color_row, axis=1)
                                              .format({
-                                                 'rs_ratio': '{:.1f}',
-                                                 'rs_momentum': '{:.1f}',
-                                                 'breadth': '{:.0%}',
-                                                 'concentration': '{:.0%}',
-                                                 'turnover_shock_z': '{:.1f}σ'
+                                                 'rs_ratio': lambda x: safe_format(x, '{:.1f}'),
+                                                 'rs_momentum': lambda x: safe_format(x, '{:.1f}'),
+                                                 'breadth': lambda x: safe_format(x, '{:.0%}'),
+                                                 'concentration': lambda x: safe_format(x, '{:.0%}'),
+                                                 'turnover_shock_z': lambda x: safe_format(x, '{:.1f}σ')
                                              }),
                         use_container_width=True,
                         height=500

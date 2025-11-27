@@ -65,6 +65,7 @@ def timeout_handler(signum, frame):
 def load_backtest_data_and_model(challenger_version, symbol_cap=100):
     """
     Loads the challenger model artifact and the data required for backtesting.
+    Injects Context Features (One-Hot Encoded Scenarios).
     """
     print(f"Loading model artifact for '{challenger_version}'...")
     model_path = os.path.join(ARTIFACTS_DIR, f"{challenger_version}.pkl")
@@ -76,8 +77,8 @@ def load_backtest_data_and_model(challenger_version, symbol_cap=100):
     print(f"Loading backtest feature and price data (capped at {symbol_cap} symbols)...")
     with get_db_connection() as conn:
         # Load all historical features and prices for the selected symbols
-        # Load all historical features and prices for the selected symbols
         # Join features_gold_serving with ta_silver to get price
+        # AND join predator_signals for context
         sql = f"""
             WITH top_symbols AS (
                 SELECT symbol FROM features_gold_serving GROUP BY symbol ORDER BY COUNT(*) DESC LIMIT {symbol_cap}
@@ -88,26 +89,119 @@ def load_backtest_data_and_model(challenger_version, symbol_cap=100):
                 ts.close as price_close,
                 fg.hmm_state,
                 fg."HunterScore" as hunter_score,
-                fg."FrothScore" as froth_score
+                fg."FrothScore" as froth_score,
+                fg."RSI_3" as rsi_3,
+                fg."Slope_LinearReg_3d" as slope_3d,
+                fg."Rel_Vol_1d" as rel_vol,
+                fg."OBV_Slope_5d" as obv_slope,
+                fg."MFI_14" as mfi_14,
+                fg."NATR_14" as natr_14,
+                fg."BB_Width" as bb_width,
+                ps.active_scenarios
             FROM features_gold_serving fg
             JOIN ta_silver ts ON fg.symbol = ts.symbol AND fg.effective_date = ts.trade_date
+            LEFT JOIN predator_signals ps ON fg.symbol = ps.symbol AND fg.effective_date = ps.signal_date
             WHERE fg.symbol IN (SELECT symbol FROM top_symbols);
         """
         df = pd.read_sql(sql, conn, index_col=['effective_date', 'symbol'])
 
     price_df = df['price_close'].unstack().astype(float)
-    feature_df = df[challenger_artifact['feature_columns']]
+    
+    # Construct Feature Matrix with Context
+    # Base features
+    base_cols = ['hmm_state', 'hunter_score', 'froth_score', 'rsi_3', 'slope_3d', 'rel_vol', 'obv_slope', 'mfi_14', 'natr_14', 'bb_width']
+    feature_df = df[base_cols].copy()
+    
+    # Context Features (One-Hot)
+    known_scenarios = [
+        "Sniper_RSI_Divergence", 
+        "Sniper_Vol_Breakout", 
+        "Mean_Reversion_BB", 
+        "Sniper_RSI_Oversold",
+        "Trend_Pullback",
+        "RSI_Oversold_Simple"
+    ]
+    
+    # Vectorized One-Hot Encoding? Or apply?
+    # Apply is safer for JSON parsing
+    def parse_scenarios(val):
+        names = set()
+        if val:
+            if isinstance(val, str):
+                try:
+                    val = json.loads(val)
+                except:
+                    pass
+            if isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict) and 'name' in item:
+                        names.add(item['name'])
+        return names
 
-    return challenger_artifact, price_df, feature_df
+    # Parse once
+    scenario_sets = df['active_scenarios'].apply(parse_scenarios)
+    
+    for sc in known_scenarios:
+        feature_df[f'is_{sc}'] = scenario_sets.apply(lambda x: 1.0 if sc in x else 0.0)
+    
+    # Ensure columns match model expectation (order matters for some models, but LightGBM handles names if dataframe?)
+    # LightGBM sklearn wrapper handles numpy array. We need to ensure column order matches training.
+    # Training columns: base_cols + known_scenarios
+    final_cols = base_cols + [f'is_{sc}' for sc in known_scenarios]
+    # Rename columns to match artifact if possible, but here we just pass values.
+    # We need to return a DataFrame that has the right columns.
+    
+    # Note: feature_df has MultiIndex (date, symbol).
+    
+    return challenger_artifact, price_df, feature_df[final_cols]
 
 
 def generate_signals(model, features):
-    """Generates entry and exit signals from model predictions."""
-    predictions = model.predict(features)
-    # Simple strategy: enter on class 1 (Breakout), exit on class 2 (Distribution)
-    entries = (predictions == 1)
-    exits = (predictions == 2)
-    return pd.Series(entries, index=features.index), pd.Series(exits, index=features.index)
+    """
+    Generates entry signals using Per-Day Top-K Policy.
+    """
+    # Predict Probabilities
+    # features is a DataFrame with MultiIndex (date, symbol)
+    # LightGBM predict_proba returns (n_samples, 2)
+    
+    try:
+        probs = model.predict_proba(features)[:, 1]
+    except:
+        # Fallback
+        probs = model.predict(features)
+        
+    # Create Series with index
+    prob_series = pd.Series(probs, index=features.index)
+    
+    # Group by Date and Select Top-K
+    # Unstack to get (Date x Symbol)
+    prob_df = prob_series.unstack()
+    
+    entries = pd.DataFrame(False, index=prob_df.index, columns=prob_df.columns)
+    
+    for date in prob_df.index:
+        day_probs = prob_df.loc[date]
+        # Filter > 0.51
+        candidates = day_probs[day_probs > 0.51]
+        
+        if not candidates.empty:
+            # Top 3
+            top_k = candidates.nlargest(3)
+            entries.loc[date, top_k.index] = True
+            
+    # Exits: For simplicity in this backtest, we hold for 5 days (Sniper) or exit if regime changes?
+    # The original code used Class 2 (Distribution) for exit.
+    # But our model is binary (Buy/No Buy).
+    # So we simulate a fixed holding period or exit if signal lost?
+    # Let's use a simple 5-day hold for Sniper logic (since labels are T+5).
+    # Or just use the entries and let vectorbt handle exits (e.g. fixed time).
+    # But vectorbt needs exit signals.
+    # Let's say we exit after 5 days.
+    
+    # Create exits: entries shifted by 5 days
+    exits = entries.shift(5).fillna(False)
+    
+    return entries, exits
 
 
 def run_wfo_backtest(champion_version, challenger_version):
@@ -132,8 +226,8 @@ def run_wfo_backtest(champion_version, challenger_version):
 
         # Generate signals using the challenger model
         entries, exits = generate_signals(challenger_artifact['main'], feature_df)
-        entries = entries.unstack().fillna(False).astype(bool)
-        exits = exits.unstack().fillna(False).astype(bool)
+        entries = entries.fillna(False).astype(bool)
+        exits = exits.fillna(False).astype(bool)
         
         # Ensure price is float and fill NaNs (forward fill then backward fill)
         price_df = price_df.ffill().bfill().astype(float)
@@ -185,7 +279,11 @@ def run_wfo_backtest(champion_version, challenger_version):
              return {'sharpe_elitist': 0.0, 'max_drawdown': 0.0, 'oos_trades': 0}
 
         # Aggregate stats (average Sharpe, worst DD)
-        avg_sharpe = np.mean([s['Sharpe Ratio'] for s in all_stats])
+        sharpes = [s['Sharpe Ratio'] for s in all_stats]
+        # Sanitize Infinity (e.g. single trade with 0 volatility)
+        sharpes = [s if np.isfinite(s) else 0.0 for s in sharpes]
+        
+        avg_sharpe = np.mean(sharpes)
         worst_dd = np.min([s['Max Drawdown [%]'] for s in all_stats]) / 100
         total_trades = np.sum([s['Total Trades'] for s in all_stats])
 

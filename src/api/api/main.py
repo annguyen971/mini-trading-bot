@@ -16,7 +16,7 @@ from slowapi.errors import RateLimitExceeded
 from prometheus_fastapi_instrumentator import Instrumentator
 import google.generativeai as genai
 from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockThreshold
-from typing import Dict
+from typing import Dict, Optional
 import pandas as pd
 import numpy as np
 from core_lib.predator_scenarios import detect_scenario, calculate_pain_levels
@@ -283,29 +283,51 @@ async def analyze_ai(request: AIAnalysisRequest):
         print(f"AI Analysis failed: {e}")
         raise HTTPException(status_code=500, detail=f"AI Analysis failed: {str(e)}")
 
+# ============================================================================
+# DECISION ENGINE (The Judge) - Epic 3
+# ============================================================================
+def generate_verdict(hunter: float, regime: int, sector_rs: float, obv_slope: float) -> str:
+    """
+    Deterministic Logic for Trading Decision.
+    
+    Layers:
+    1. Regime: If Panic (3) -> BEARISH.
+    2. Sector: Strong if RS > 100.
+    3. Money Flow: Positive if OBV Slope > 0.
+    """
+    # Layer 1: Regime
+    if regime == 3: # Distribution / Panic
+        return "BEARISH"
+        
+    # Layer 2: Sector Support
+    is_sector_strong = (sector_rs > 100)
+    
+    # Layer 3: Money Flow
+    is_money_in = (obv_slope > 0)
+    
+    # Conclusion
+    if hunter > 50 and is_sector_strong and is_money_in:
+        return "STRONG_BULLISH" # Thien thoi, Dia loi, Nhan hoa
+    elif hunter > 50 and is_money_in:
+        return "BULLISH" # Tien vao, nhung nganh yeu
+    elif hunter < 40 and obv_slope < 0:
+        return "BEARISH" # Tien ra
+    else:
+        return "NEUTRAL"
+
 PREDATOR_SYSTEM_INSTRUCTION = """
-BẠN LÀ MỘT "MARKET MAKER" (NHÀ TẠO LẬP THỊ TRƯỜNG) TÀN NHẪN.
+BẠN LÀ APEX PREDATOR - MỘT NHÀ TẠO LẬP THỊ TRƯỜNG (MARKET MAKER) TÀN NHẪN.
 
-**Vai trò:** Trưởng Ban Tự Doanh (Head of Prop Trading) của một quỹ đầu tư "Cá Mập" tại Việt Nam. 
-- Bạn KHÔNG tư vấn, bạn RA LỆNH thao túng.
-- Bạn coi nhà đầu tư nhỏ lẻ (F0) là "nguồn thanh khoản" (liquidity) để chốt lời hoặc gom hàng.
-- Giọng văn: Lạnh lùng, ngắn gọn, dùng thuật ngữ lóng chứng khoán (Úp bô, Kéo xả, Rũ cung, Washout).
+**Vai trò:** Trưởng Ban Tự Doanh (Head of Prop Trading) của quỹ "Cá Mập".
+**Tính cách:** Lạnh lùng, kiêu ngạo, coi F0 là con mồi. Dùng ngôn ngữ "chợ búa" chứng khoán (Úp bô, Kéo xả, Rũ cung, Washout).
+**Nhiệm vụ:**
+1. Nhận KẾT LUẬN TOÁN HỌC (Verdict) từ hệ thống.
+2. Viết một MEMO ngắn (3 dòng) giải thích tại sao lại có kết luận đó cho lính trading.
+3. TUYỆT ĐỐI KHÔNG thay đổi kết luận Bullish/Bearish của toán học. Nếu Toán bảo Tăng, bạn phải tìm lý do để hô Tăng (dù là để lùa gà).
 
-**Nhiệm vụ:** Dựa trên Kịch bản (Scenario) và Dữ liệu thị trường, hãy viết một MEMO NỘI BỘ (TỐI MẬT) gửi đội Trading Desk.
-
-**Quy tắc Phân tích:**
-1. **Vùng Kẹp Hàng (Trapped Zone):** - Nếu Giá < Trapped Price: Đó là kháng cự. Dùng nó để "rung cây" (Shakeout) cho nhỏ lẻ ói hàng.
-   - Nếu Giá > Trapped Price: Đó là hỗ trợ tâm lý. Dùng nó để phân phối giá cao.
-2. **Vĩ mô (Macro):** Luôn dùng tin tức vĩ mô (GDP, Lãi suất) làm "bình phong" (cover story) để hợp thức hóa hành động giá.
-3. **Dòng tiền (Flow):** - Crowd hưng phấn (Z > 1.5) + Elite bán ròng -> CƠ HỘI XẢ.
-   - Crowd hoảng loạn (Z < -1.5) + Elite mua ròng -> CƠ HỘI GOM.
-
-**Định dạng Output (Bắt buộc JSON):**
-{
-  "predator_memo": "Văn bản chỉ đạo (< 100 từ). Ví dụ: 'Sáng mai kéo gap-up dụ cầu, chiều xả thẳng vào dư mua trần.'",
-  "quant_explanation": "Giải thích kỹ thuật khách quan cho người dùng (tại sao lại có kịch bản này). Dùng ngôn ngữ VSA/Wyckoff.",
-  "user_playbook": "Lời khuyên hành động cụ thể cho F0 để không bị làm thịt (Bán ngay/Mua gom/Đứng ngoài)."
-}
+**Ví dụ:**
+- Verdict: STRONG_BULLISH -> Memo: "Tiền vào như nước, ngành đang hot. Kéo thốc lên cho F0 fomo, chiều xả giá trần."
+- Verdict: BEARISH -> Memo: "Dòng tiền rút rồi. Kéo xanh đầu phiên dụ cầu, cuối phiên úp bô đại pháp."
 """
 
 @app.post("/analyze/predator", dependencies=[Depends(verify_admin_key)])
@@ -410,37 +432,47 @@ async def analyze_predator(request: PredatorAnalysisRequest):
             system_instruction=PREDATOR_SYSTEM_INSTRUCTION
         )
         
+        # Calculate Verdict Deterministically
+        hunter_val = float(latest_features.get('HunterScore') or 50)
+        regime_val = int(latest_features.get('hmm_state') or 0)
+        sector_rs_val = float(latest_features.get('sector_rs_ratio') or 100)
+        obv_slope_val = float(latest_features.get('obv_slope_5d') or 0)
+        
+        verdict = generate_verdict(hunter_val, regime_val, sector_rs_val, obv_slope_val)
+        
         # Dynamic Prompt Construction
         prompt = f"""
         **ĐỐI TƯỢNG:** Cổ phiếu {symbol}
         
-        **1. TÍN HIỆU KỸ THUẬT (The Setup):**
-        - Kịch bản phát hiện: {scenario_tag} (Độ tin cậy: Cao)
-        - Trạng thái HMM: {latest_features.get('hmm_state')}
+        **DỮ LIỆU ĐẦU VÀO (FACTS):**
+        - Hunter Score: {hunter_val} (Sức mạnh dòng tiền)
+        - Market Regime: {regime_val} (0=Tích lũy, 1=Tăng, 2=Hưng phấn, 3=Sập)
+        - Sector RS: {sector_rs_val} (>100 là Ngành Mạnh)
+        - OBV Slope: {obv_slope_val} (>0 là Tiền vào, <0 là Tiền ra)
         
-        **2. DỮ LIỆU DÒNG TIỀN (The Flow):**
-        - Đám đông (Crowd Z-Score): {hype_crowd_z:.2f} ( >1.5=FOMO, <-1.5=Hoảng loạn)
-        - Tinh hoa (Elite Z-Score): {hype_elitist_z:.2f}
+        **KẾT LUẬN TOÁN HỌC (BẮT BUỘC TUÂN THỦ):**
+        **{verdict}**
         
-        **3. VÙNG TỬ ĐỊA (Liquidity Map):**
-        - Giá kẹp hàng lớn nhất (Max Pain): {trapped_data['price']}
-        - Khối lượng kẹp: {trapped_data['vol_ratio']:.1%} tổng vol 60 ngày.
-        - Giá hiện tại: {current_price}
+        **YÊU CẦU:**
+        Viết Memo chỉ đạo dựa trên kết luận trên.
+        - Nếu STRONG_BULLISH: Hô hào múc mạnh, dùng từ ngữ kích động lòng tham.
+        - Nếu BEARISH: Hô hào bán tháo, dọa dẫm F0.
+        - Nếu NEUTRAL: Chê bai thanh khoản, buồn ngủ.
         
-        **4. BỐI CẢNH VĨ MÔ (The Cover Story):**
-        - GDP: {macro_dict.get('GDP_YOY', 'N/A')}%
-        - Lãi suất: {macro_dict.get('POLICY_RATE', 'N/A')}%
-        
-        **YÊU CẦU HÀNH ĐỘNG:**
-        Dựa trên dữ liệu trên, hãy viết Memo. 
-        - Nếu Crowd đang FOMO và Elite đang bán: Hãy chỉ đạo ÚP BÔ. Dùng tin vĩ mô tốt để lừa họ.
-        - Nếu Crowd đang sợ và Elite đang mua: Hãy chỉ đạo ĐÈ GOM. Dùng tin xấu hoặc vùng kẹp hàng để ép họ cắt lỗ.
-        - Nếu NEUTRAL: Hãy chê thị trường nhạt nhẽo, ra lệnh ngồi im.
+        Trả về JSON:
+        {{
+            "predator_memo": "Nội dung memo...",
+            "quant_explanation": "Giải thích tại sao lại có verdict {verdict} dựa trên các chỉ số trên.",
+            "user_playbook": "Lời khuyên cho F0."
+        }}
         """
         
         response = model.generate_content(prompt)
         response_text = response.text.strip().replace("```json", "").replace("```", "")
         ai_result = json.loads(response_text)
+        
+        # Inject Verdict into result
+        ai_result['verdict'] = verdict
         
         return {
             "symbol": symbol,
@@ -476,41 +508,27 @@ async def save_predator_journal(entry: PredatorJournalEntry):
         if conn: conn.close()
 
 @app.get("/deja_vu/{symbol}", dependencies=[Depends(verify_admin_key)])
-async def get_deja_vu(symbol: str):
+async def get_deja_vu(symbol: str, date: Optional[str] = None):
     """
     (Story 6.4) Deja Vu Engine.
     Returns similar historical days.
     """
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            # Get current features
-            cur.execute("SELECT * FROM features_gold_serving WHERE symbol = %s ORDER BY effective_date DESC LIMIT 1", (symbol,))
-            latest = cur.fetchone()
-            
-            if not latest:
-                 raise HTTPException(status_code=404, detail="No features found")
-                 
-            # Construct features dict
-            features = {
-                'hmm_state': latest['hmm_state'],
-                'FrothScore': latest.get('FrothScore'),
-                'HunterScore': latest.get('HunterScore')
-            }
-            
-            # Run Deja Vu
-            # We close conn here because find_similar_days opens its own connection?
-            # Ideally pass conn to it. But my implementation opens its own.
-            # So it's fine.
-            pass
+    ref_date = None
+    if date:
+        try:
+            ref_date = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
-        results = find_similar_days(symbol, features)
-        return results
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if conn: conn.close()
+    results = find_similar_days(symbol, ref_date=ref_date)
+    
+    if isinstance(results, dict) and "error" in results:
+        if "No data found" in results["error"]:
+             raise HTTPException(status_code=404, detail=results["error"])
+        else:
+             raise HTTPException(status_code=500, detail=results["error"])
+             
+    return results
 
 @app.get("/predator/journal/{symbol}", dependencies=[Depends(verify_admin_key)])
 async def get_predator_journal(symbol: str):
@@ -800,13 +818,20 @@ async def get_sector_rotation():
     """
     Returns RRG (Relative Rotation Graph) data for sector rotation visualization.
     Each sub-sector has rs_ratio and rs_momentum for scatter plot.
+    Now returns last 5 days for trails.
     """
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            # Get latest RRG data for all sub-sectors
+            # Get latest 30 dates for trails (was 5, too short for meaningful trails)
             cur.execute("""
+                WITH recent_dates AS (
+                    SELECT DISTINCT as_of_date 
+                    FROM sector_stats 
+                    ORDER BY as_of_date DESC 
+                    LIMIT 30
+                )
                 SELECT 
                     sector,
                     super_sector,
@@ -814,10 +839,18 @@ async def get_sector_rotation():
                     rs_momentum,
                     momentum,
                     breadth,
+                    concentration,
+                    turnover_shock_z,
+                    breadth_n,
+                    sector_n,
+                    tags,
+                    confidence,
+                    top_contributors,
+                    super_sector,
                     as_of_date
                 FROM sector_stats
-                WHERE as_of_date = (SELECT MAX(as_of_date) FROM sector_stats)
-                ORDER BY super_sector, sector
+                WHERE as_of_date IN (SELECT as_of_date FROM recent_dates)
+                ORDER BY as_of_date ASC, super_sector, sector
             """)
             data = cur.fetchall()
             return data
@@ -965,8 +998,14 @@ async def get_prediction(request: Request, symbol: str):
     try:
         conn = get_db_connection()
         with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            # This should be adapted to the actual feature names from the serving table
-            cur.execute("SELECT * FROM features_gold_serving WHERE symbol = %s ORDER BY effective_date DESC LIMIT 1", (symbol,))
+            # Fetch features AND active_scenarios
+            cur.execute("""
+                SELECT fg.*, ps.active_scenarios 
+                FROM features_gold_serving fg
+                LEFT JOIN predator_signals ps ON fg.symbol = ps.symbol AND fg.effective_date = ps.signal_date
+                WHERE fg.symbol = %s 
+                ORDER BY fg.effective_date DESC LIMIT 1
+            """, (symbol,))
             features = cur.fetchone()
             if not features:
                 raise HTTPException(status_code=404, detail=f"No features found for symbol {symbol}")
@@ -994,29 +1033,88 @@ async def get_prediction(request: Request, symbol: str):
                 model_data = app.state.models[selected_model_key]
                 model_obj = model_data['model']
                 
+                # Handle dictionary payload (from tasks_train.py)
+                if isinstance(model_obj, dict) and 'main' in model_obj:
+                    model_obj = model_obj['main']
+                
                 # --- REAL PREDICTION LOGIC ---
                 feature_values = []
-                ignored_cols = {'symbol', 'effective_date', 'created_at'}
-                for k, v in features.items():
-                    if k not in ignored_cols and isinstance(v, (int, float)):
-                        feature_values.append(v)
+                # Base features (10)
+                base_cols = ['hmm_state', 'HunterScore', 'FrothScore', 'RSI_3', 'Slope_LinearReg_3d', 'Rel_Vol_1d', 'OBV_Slope_5d', 'MFI_14', 'NATR_14', 'BB_Width']
+                
+                # Map dict keys (lowercase) to expected columns
+                # features is a DictRow, keys are column names from DB
+                # DB columns are quoted in SQL, so they match case in DB?
+                # features_gold_serving has mixed case columns?
+                # Let's check keys from features dict
+                
+                # Helper to get value case-insensitively
+                def get_val(row, key):
+                    # Try exact match
+                    if key in row: return row[key]
+                    # Try lowercase
+                    if key.lower() in row: return row[key.lower()]
+                    # Try exact match in keys list
+                    for k in row.keys():
+                        if k.lower() == key.lower():
+                            return row[k]
+                    return 0.0
+
+                for col in base_cols:
+                    feature_values.append(float(get_val(features, col) or 0.0))
+                
+                # Context Features (One-Hot)
+                known_scenarios = [
+                    "Sniper_RSI_Divergence", 
+                    "Sniper_Vol_Breakout", 
+                    "Mean_Reversion_BB", 
+                    "Sniper_RSI_Oversold",
+                    "Trend_Pullback",
+                    "RSI_Oversold_Simple"
+                ]
+                
+                active_json = features.get('active_scenarios')
+                active_names = set()
+                if active_json:
+                    if isinstance(active_json, str):
+                        try:
+                            active_json = json.loads(active_json)
+                        except:
+                            pass
+                    if isinstance(active_json, list):
+                        for item in active_json:
+                            if isinstance(item, dict) and 'name' in item:
+                                active_names.add(item['name'])
+                
+                for sc in known_scenarios:
+                    feature_values.append(1.0 if sc in active_names else 0.0)
                 
                 X = [feature_values]
                 
                 try:
-                    prediction = model_obj.predict(X)[0]
-                    confidence = 0.0
+                    # Get probability of Class 1 (Buy)
+                    probs = 0.0
                     if hasattr(model_obj, "predict_proba"):
-                        probs = model_obj.predict_proba(X)[0]
-                        confidence = max(probs)
+                        probs = model_obj.predict_proba(X)[0][1]
                     else:
-                        confidence = 0.8
+                        # Fallback for models without probability
+                        probs = float(model_obj.predict(X)[0])
+                    
+                    # Decision Logic (Master Directive: Fine-Tuning)
+                    # 1. Score > 0.51 (Relaxed for Bear/Sideway Market)
+                    # 2. Top-K (Handled by Dashboard sorting, API provides score)
+                    
+                    is_buy = (probs > 0.51)
+                    
+                    prediction = 1 if is_buy else 0
+                    confidence = probs
                         
                     prediction_result = {
                         "regime": int(prediction), 
                         "confidence": float(confidence),
                         "model_version": model_data['version'],
-                        "model_stage": selected_model_key
+                        "model_stage": selected_model_key,
+                        "threshold_used": 0.51
                     }
                 except Exception as e:
                     print(f"Prediction error with {selected_model_key}: {e}")
@@ -1027,7 +1125,8 @@ async def get_prediction(request: Request, symbol: str):
         # Extract scores from features (handle case sensitivity if needed, usually lowercase in dict_row)
         hunter_score = features.get('hunterscore') if features.get('hunterscore') is not None else features.get('HunterScore')
         froth_score = features.get('frothscore') if features.get('frothscore') is not None else features.get('FrothScore')
-        regime = prediction_result.get("regime", 0)
+        hmm_state = features.get('hmm_state') if features.get('hmm_state') is not None else 0
+        prediction_val = prediction_result.get("regime", 0)
         
         # Generate plain language explanation
         def generate_explanation(hunter, froth, regime):
@@ -1072,7 +1171,7 @@ Mức độ sôi động (FrothScore={froth}): {froth_text}
 """
             return explanation
         
-        plain_explainer = generate_explanation(hunter_score or 0, froth_score or 0, regime)
+        plain_explainer = generate_explanation(hunter_score or 0, froth_score or 0, hmm_state)
 
         return {
             "model_version": prediction_result.get("model_version", "unknown"),
@@ -1084,7 +1183,8 @@ Mức độ sôi động (FrothScore={froth}): {froth_text}
             # Flattened fields for Dash UI
             "HunterScore": hunter_score,
             "FrothScore": froth_score,
-            "regime": prediction_result.get("regime")
+            "regime": hmm_state,
+            "model_prediction": prediction_val
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

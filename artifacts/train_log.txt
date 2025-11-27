@@ -1,0 +1,73 @@
+/usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2749: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names
+  warnings.warn(
+/usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2749: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names
+  warnings.warn(
+/usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2749: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names
+  warnings.warn(
+/usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2749: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names
+  warnings.warn(
+/usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2749: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names
+  warnings.warn(
+/usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2749: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names
+  warnings.warn(
+/usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2749: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names
+  warnings.warn(
+/usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2749: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names
+  warnings.warn(
+/usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2749: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names
+  warnings.warn(
+/usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2749: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names
+  warnings.warn(
+/usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2749: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names
+  warnings.warn(
+============================================================
+Model Training Pipeline starting...
+============================================================
+Database connection established successfully.
+  Acquired lock 'train_batch'
+
+Checking training triggers...
+  Training triggers activated:
+  - Force training enabled via FORCE_TRAIN flag
+
+Running Walk-Forward Optimization (WFO)...
+  Fold 1: Train 2024-11-25 to 2025-05-24, Test 2025-05-25 to 2025-06-24
+    Skipping fold: insufficient data (train=0, test=12)
+  Fold 2: Train 2024-12-25 to 2025-06-23, Test 2025-06-24 to 2025-07-24
+    Training model on 12 samples...
+    Best Threshold: 0.5000
+  Fold 3: Train 2025-01-24 to 2025-07-23, Test 2025-07-24 to 2025-08-23
+    Training model on 26 samples...
+    Best Threshold: 0.5000
+  Fold 4: Train 2025-02-23 to 2025-08-22, Test 2025-08-23 to 2025-09-22
+    Training model on 38 samples...
+    Best Threshold: 0.5000
+  Fold 5: Train 2025-03-25 to 2025-09-21, Test 2025-09-22 to 2025-10-22
+    Training model on 43 samples...
+    Best Threshold: 0.5000
+  Fold 6: Train 2025-04-24 to 2025-10-21, Test 2025-10-22 to 2025-11-21
+    Training model on 58 samples...
+    Best Threshold: 0.4711
+
+  WFO Complete:
+  Sharpe Ratio: -0.222
+  Max Drawdown: -25.94%
+  IC: 0.101
+  Win Rate: 31.58%
+
+Training final model on all data...
+  Fetched 66 training samples
+    Best Threshold: 0.4810
+  Model trained
+
+  Model saved:
+  Version: lr_20251125_021735
+  Path: /opt/artifacts/lr_20251125_021735.pkl
+  Hash: 847450cabeaa1ed6...
+
+  Auto-Suggest: REJECTED - Sharpe improvement -0.222 < 0.1
+============================================================
+Model Training Pipeline finished successfully!
+Model Version: lr_20251125_021735
+Promotion Suggestion: rejected
+============================================================

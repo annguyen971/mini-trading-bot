@@ -15,10 +15,11 @@ import json
 import os
 import pickle
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
+from lightgbm import LGBMClassifier, early_stopping
+from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, precision_recall_curve
+from sklearn.model_selection import train_test_split
 
 from core_lib.db import get_db_connection
 
@@ -223,17 +224,15 @@ def check_training_triggers(conn) -> Tuple[bool, List[str]]:
 
 # --- Data Preparation ---
 
+# --- Data Preparation ---
+
 def fetch_training_data(conn, start_date: str, end_date: str) -> Tuple[np.ndarray, np.ndarray]:
     """
     Fetches features and labels for training.
-
-    Returns:
-        X: Feature matrix (n_samples x n_features)
-        y: Labels (n_samples,)
+    Injects Context Features (One-Hot Encoded Scenarios).
     """
     with conn.cursor() as cursor:
-        # Fetch data from features_gold_serving (Wide format)
-        # Note: macro_impact is currently excluded as it's not in features_gold_serving
+        # Fetch data including active_scenarios
         cursor.execute("""
             SELECT
                 fg.symbol,
@@ -241,15 +240,25 @@ def fetch_training_data(conn, start_date: str, end_date: str) -> Tuple[np.ndarra
                 fg.hmm_state,
                 fg."HunterScore" as hunter_score,
                 fg."FrothScore" as froth_score,
+                fg."RSI_3" as rsi_3,
+                fg."Slope_LinearReg_3d" as slope_3d,
+                fg."Rel_Vol_1d" as rel_vol,
+                fg."OBV_Slope_5d" as obv_slope,
+                fg."MFI_14" as mfi_14,
+                fg."NATR_14" as natr_14,
+                fg."BB_Width" as bb_width,
+                ps.active_scenarios,
                 COALESCE(lg.new_label, ls.state_snorkel) as label
             FROM features_gold_serving fg
+            JOIN predator_signals ps ON fg.symbol = ps.symbol 
+                                     AND fg.effective_date = ps.signal_date
             LEFT JOIN labels_silver ls ON fg.symbol = ls.symbol
                                        AND fg.effective_date = ls.effective_date
-            LEFT JOIN labels_golden lg ON ls.symbol = lg.symbol
-                                        AND ls.effective_date = lg.effective_date
+            LEFT JOIN labels_golden lg ON fg.symbol = lg.symbol
+                                        AND fg.effective_date = lg.effective_date
             WHERE fg.effective_date BETWEEN %s AND %s
               AND COALESCE(lg.new_label, ls.state_snorkel) IS NOT NULL
-              AND ls.is_golden = true
+              AND ps.scenario_count > 0
             ORDER BY fg.effective_date, fg.symbol
         """, (start_date, end_date))
 
@@ -258,30 +267,100 @@ def fetch_training_data(conn, start_date: str, end_date: str) -> Tuple[np.ndarra
     if len(rows) == 0:
         return np.array([]), np.array([])
 
-    # Extract features and labels
-    # Features: hmm_state, hunter_score, froth_score (3 features)
-    X = np.array([[row[2], row[3], row[4]] for row in rows])  # hmm, hunter, froth
-    y = np.array([row[5] for row in rows])
+    # Known scenarios for One-Hot Encoding (FLOODGATE: Updated list)
+    known_scenarios = [
+        "Sniper_RSI_Divergence", 
+        "Sniper_Vol_Breakout", 
+        "Mean_Reversion_BB", 
+        "Sniper_RSI_Oversold",
+        "Trend_Pullback",
+        "RSI_Oversold_Simple"
+    ]
+    
+    X_list = []
+    y_list = []
+    
+    for row in rows:
+        # Base features (10)
+        features = [row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11]]
+        
+        # Context Features (One-Hot)
+        active_json = row[12] # List of dicts or None
+        active_names = set()
+        if active_json:
+            if isinstance(active_json, str):
+                try:
+                    active_json = json.loads(active_json)
+                except:
+                    pass
+            if isinstance(active_json, list):
+                for item in active_json:
+                    if isinstance(item, dict) and 'name' in item:
+                        active_names.add(item['name'])
+        
+        # Add 1/0 for each known scenario
+        for sc in known_scenarios:
+            features.append(1.0 if sc in active_names else 0.0)
+            
+        X_list.append(features)
+        y_list.append(row[13])
+
+    X = np.array(X_list)
+    y = np.array(y_list)
 
     return X, y
 
 # --- Model Training ---
 
-def train_model(X_train: np.ndarray, y_train: np.ndarray) -> LogisticRegression:
+def optimize_threshold(y_true: np.ndarray, y_probs: np.ndarray, min_precision: float = 0.6) -> float:
     """
-    Trains Logistic Regression model.
+    Calculates dynamic threshold based on Top 10% (90th Percentile).
+    """
+    if len(y_probs) == 0:
+        return 0.5
+    threshold = np.percentile(y_probs, 90)
+    return float(threshold)
 
-    Simple model choice for interpretability and speed.
+def train_model(X_train: np.ndarray, y_train: np.ndarray) -> Tuple[LGBMClassifier, float]:
     """
-    model = LogisticRegression(
+    Trains LightGBM model with 'Low & Slow' parameters to prevent overfitting.
+    """
+    # Split for validation
+    X_t, X_v, y_t, y_v = train_test_split(X_train, y_train, test_size=0.2, random_state=RANDOM_STATE)
+    
+    # Master Directive: Low & Slow Tuning
+    model = LGBMClassifier(
+        n_estimators=200,        # Reduced from 500
+        learning_rate=0.03,      # Slow learning
+        num_leaves=7,            # Small trees
+        max_depth=3,             # Shallow trees
+        min_child_samples=20,    # Robust leaves
+        reg_alpha=0.5,           # L1 Regularization
+        reg_lambda=0.5,          # L2 Regularization
+        class_weight='balanced',
+        objective='binary',
+        metric='auc',
         random_state=RANDOM_STATE,
-        max_iter=1000,
-        class_weight='balanced'  # Handle class imbalance
+        verbose=-1
     )
 
-    model.fit(X_train, y_train)
+    model.fit(
+        X_t, y_t,
+        eval_set=[(X_v, y_v)],
+        callbacks=[early_stopping(stopping_rounds=50, verbose=False)]
+    )
+    
+    # Optimize threshold
+    y_probs_val = model.predict_proba(X_v)[:, 1]
+    best_threshold = optimize_threshold(y_v, y_probs_val)
+    
+    print(f"    Best Threshold (Top 10%): {best_threshold:.4f}")
 
-    return model
+    return model, best_threshold
+
+# ... (WFO function remains mostly same, but fetch_training_data call is updated implicitly) ...
+# ... (save_model_to_registry needs to update feature_columns) ...
+
 
 # --- Walk-Forward Optimization (WFO) - Story 4.2 ---
 
@@ -332,21 +411,31 @@ def run_wfo_backtest(conn, start_date: str, end_date: str) -> Dict:
                     fg.hmm_state,
                     fg."HunterScore" as hunter_score,
                     fg."FrothScore" as froth_score,
+                    fg."RSI_3" as rsi_3,
+                    fg."Slope_LinearReg_3d" as slope_3d,
+                    fg."Rel_Vol_1d" as rel_vol,
+                    fg."OBV_Slope_5d" as obv_slope,
+                    fg."MFI_14" as mfi_14,
+                    fg."NATR_14" as natr_14,
+                    fg."BB_Width" as bb_width,
+                    ps.active_scenarios,
                     COALESCE(lg.new_label, ls.state_snorkel) as label,
                     ts_curr.close as current_price,
                     ts_next.close as next_price
                 FROM features_gold_serving fg
+                JOIN predator_signals ps ON fg.symbol = ps.symbol 
+                                         AND fg.effective_date = ps.signal_date
                 LEFT JOIN labels_silver ls ON fg.symbol = ls.symbol
                                            AND fg.effective_date = ls.effective_date
-                LEFT JOIN labels_golden lg ON ls.symbol = lg.symbol
-                                            AND ls.effective_date = lg.effective_date
+                LEFT JOIN labels_golden lg ON fg.symbol = lg.symbol
+                                            AND fg.effective_date = lg.effective_date
                 JOIN ta_silver ts_curr ON fg.symbol = ts_curr.symbol 
                                         AND fg.effective_date = ts_curr.trade_date
                 LEFT JOIN ta_silver ts_next ON fg.symbol = ts_next.symbol
-                                             AND ts_next.trade_date = fg.effective_date + INTERVAL '1 day'
+                                             AND ts_next.trade_date = fg.effective_date + INTERVAL '5 days'
                 WHERE fg.effective_date BETWEEN %s AND %s
                   AND COALESCE(lg.new_label, ls.state_snorkel) IS NOT NULL
-                  AND ls.is_golden = true
+                  AND ps.scenario_count > 0
                 ORDER BY fg.effective_date, fg.symbol
             """, (test_start.strftime('%Y-%m-%d'), test_end.strftime('%Y-%m-%d')))
             
@@ -358,18 +447,55 @@ def run_wfo_backtest(conn, start_date: str, end_date: str) -> Dict:
             continue
 
         # Extract features, labels, and prices in perfect alignment
-        X_test = np.array([[row[2], row[3], row[4]] for row in test_rows])  # hmm, hunter, froth
-        y_test = np.array([row[5] for row in test_rows])
+        # Features: hmm, hunter, froth, rsi, slope, rel_vol, obv, mfi, natr, bb + 4 Context
         
-        # Calculate real forward returns
+        known_scenarios = [
+            "Sniper_RSI_Divergence", 
+            "Sniper_Vol_Breakout", 
+            "Mean_Reversion_BB", 
+            "Sniper_RSI_Oversold",
+            "Trend_Pullback",
+            "RSI_Oversold_Simple"
+        ]
+        
+        X_test_list = []
+        y_test_list = []
         forward_returns = []
+        
         for row in test_rows:
-            curr_price = row[6]  # current_price
-            next_price = row[7]  # next_price
+            # Base features (10)
+            features = [row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11]]
+            
+            # Context Features (One-Hot)
+            active_json = row[12]
+            active_names = set()
+            if active_json:
+                if isinstance(active_json, str):
+                    try:
+                        active_json = json.loads(active_json)
+                    except:
+                        pass
+                if isinstance(active_json, list):
+                    for item in active_json:
+                        if isinstance(item, dict) and 'name' in item:
+                            active_names.add(item['name'])
+            
+            for sc in known_scenarios:
+                features.append(1.0 if sc in active_names else 0.0)
+                
+            X_test_list.append(features)
+            y_test_list.append(row[13])
+            
+            # Returns
+            curr_price = row[14]
+            next_price = row[15]
             if next_price and curr_price and curr_price > 0:
                 forward_returns.append((next_price - curr_price) / curr_price)
             else:
                 forward_returns.append(0.0)
+                
+        X_test = np.array(X_test_list)
+        y_test = np.array(y_test_list)
         
         # Verify perfect alignment
         assert len(X_test) == len(y_test) == len(forward_returns), \
@@ -378,21 +504,74 @@ def run_wfo_backtest(conn, start_date: str, end_date: str) -> Dict:
         if len(X_train) < 10 or len(X_test) < 5:
             print(f"    Skipping fold: insufficient data (train={len(X_train)}, test={len(X_test)})")
             fold_count += 1
+
             continue
 
-        # Train model
-        model = train_model(X_train, y_train)
+        # Check for single class
+        if len(np.unique(y_train)) < 2:
+            print(f"    Skipping fold: training data has only 1 class ({np.unique(y_train)})")
+            fold_count += 1
+            continue
+
+        # Train model on this fold
+        print(f"    Training model on {len(X_train)} samples...")
+        model, threshold = train_model(X_train, y_train)
 
         # Predict on test set
-        y_pred_proba = model.predict_proba(X_test)[:, 1]  # Probability of BUY class
+        y_probs = model.predict_proba(X_test)[:, 1]  # Probability of BUY class
         
-        # Apply strategy: go long if predict BUY (prob > 0.5), else flat
+        # --- Master Directive: Per-Day Top-K Policy ---
+        # Instead of fixed threshold, we select Top-K per day.
+        # But here we are processing a whole month of test data.
+        # We need to group by date to simulate daily trading.
+        
+        # Create a DataFrame-like structure for grouping
+        # indices correspond to test_rows
+        
+        # We need dates for grouping
+        test_dates = [row[1] for row in test_rows]
+        
+        y_pred = np.zeros(len(y_probs), dtype=int)
+        
+        # Group by date
+        unique_dates = sorted(list(set(test_dates)))
+        
+        for date in unique_dates:
+            # Find indices for this date
+            indices = [i for i, d in enumerate(test_dates) if d == date]
+            
+            if not indices:
+                continue
+                
+            # Get scores for this date
+            day_probs = y_probs[indices]
+            
+            # Filter: Score > 0.6 (Safety)
+            # Sort and take Top 3
+            
+            # Create list of (index, prob)
+            candidates = []
+            for idx, prob in zip(indices, day_probs):
+                if prob > 0.6:
+                    candidates.append((idx, prob))
+            
+            # Sort by prob desc
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            
+            # Take Top 3
+            top_k = candidates[:3]
+            
+            # Mark as BUY
+            for idx, _ in top_k:
+                y_pred[idx] = 1
+        
+        # Apply strategy: go long if predict BUY, else flat
         strategy_returns = []
-        for i, prob in enumerate(y_pred_proba):
-            position = 1.0 if prob > 0.5 else 0.0  # 1 = long, 0 = flat
+        for i, prediction in enumerate(y_pred):
+            position = 1.0 if prediction == 1 else 0.0  # 1 = long, 0 = flat
             strategy_returns.append(position * forward_returns[i])
 
-        all_predictions.extend(y_pred_proba)
+        all_predictions.extend(y_probs) # Store probabilities for IC calculation
         all_actuals.extend(y_test)
         all_returns.extend(strategy_returns)
 
@@ -427,7 +606,7 @@ def run_wfo_backtest(conn, start_date: str, end_date: str) -> Dict:
 
 # --- Model Registry (AC7) ---
 
-def save_model_to_registry(conn, model: LogisticRegression, metrics: Dict, artifacts_dir: str = "/opt/artifacts") -> str:
+def save_model_to_registry(conn, model: Any, threshold: float, metrics: Dict, artifacts_dir: str = "/opt/artifacts") -> str:
     """
     Saves model to file and registers in model_registry table.
 
@@ -446,7 +625,13 @@ def save_model_to_registry(conn, model: LogisticRegression, metrics: Dict, artif
 
     artifact = {
         'main': model,
-        'feature_columns': ['hmm_state', 'hunter_score', 'froth_score']
+        'threshold': threshold,
+        'feature_columns': [
+            'hmm_state', 'hunter_score', 'froth_score', 'rsi_3', 'slope_3d', 
+            'rel_vol', 'obv_slope', 'mfi_14', 'natr_14', 'bb_width',
+            'is_Sniper_RSI_Divergence', 'is_Sniper_Vol_Breakout', 
+            'is_Mean_Reversion_BB', 'is_Sniper_RSI_Oversold'
+        ]
     }
 
     with open(model_path, 'wb') as f:
@@ -464,7 +649,7 @@ def save_model_to_registry(conn, model: LogisticRegression, metrics: Dict, artif
                 model_version, model_type, file_path, artifact_sha256,
                 metrics, is_active, promotion_suggestion, metadata
             ) VALUES (
-                %s, 'LogisticRegression', %s, %s,
+                %s, 'LightGBM', %s, %s,
                 %s::jsonb, false, 'pending_review', %s::jsonb
             )
         """, (
@@ -475,7 +660,9 @@ def save_model_to_registry(conn, model: LogisticRegression, metrics: Dict, artif
             json.dumps({
                 'feature_set_version': 'v1.0',
                 'random_state': RANDOM_STATE,
-                'trained_at': timestamp
+                'trained_at': timestamp,
+                'threshold': threshold,
+                'percentile_90_threshold': threshold  # Explicitly save as requested
             })
         ))
 
@@ -604,33 +791,28 @@ def run_train_batch():
 
         # Step 2: Run WFO backtest (Story 4.2)
         backtest_end = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-        backtest_start = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+        backtest_start = (datetime.now() - timedelta(days=1825)).strftime('%Y-%m-%d')
 
-        metrics = run_wfo_backtest(conn, backtest_start, backtest_end)
+        wfo_metrics = run_wfo_backtest(conn, backtest_start, backtest_end)
 
-        # Step 3: Train final model on all available data
+        # AC5: Train final model on all data
         print("\nTraining final model on all data...")
-        train_end = backtest_end
-        train_start = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
+        # Fetch all data
+        X_all, y_all = fetch_training_data(conn, (datetime.now() - timedelta(days=1825)).strftime('%Y-%m-%d'), datetime.now().strftime('%Y-%m-%d'))
+        
+        if len(X_all) == 0:
+             print("Error: No training data found for final model.")
+             return 1
 
-        X_train, y_train = fetch_training_data(conn, train_start, train_end)
+        print(f"  Fetched {len(X_all)} training samples")
+        final_model, final_threshold = train_model(X_all, y_all)
+        print("  Model trained")
 
-        if len(X_train) < 20:
-            print(f"ERROR: Insufficient training data ({len(X_train)} samples)")
-            return 1
-
-        # FIX 3: Remove weird char
-        print(f"  Fetched {len(X_train)} training samples")
-
-        model = train_model(X_train, y_train)
-        # FIX 3: Remove weird char
-        print(f"  Model trained")
-
-        # Step 4: Save to model registry (AC7)
-        model_version = save_model_to_registry(conn, model, metrics)
+        # AC6: Save to registry
+        model_version = save_model_to_registry(conn, final_model, final_threshold, wfo_metrics)
 
         # Step 5: Auto-suggest promotion (Story 4.3)
-        suggestion = auto_suggest_promotion(conn, model_version, metrics)
+        suggestion = auto_suggest_promotion(conn, model_version, wfo_metrics)
 
         # Update model registry with suggestion
         with conn.cursor() as cursor:

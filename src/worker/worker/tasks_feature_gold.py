@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 DB_URL = os.getenv("DB_URL")
 if not DB_URL:
     raise ValueError("DB_URL environment variable is not set!")
+
+# Fix for psycopg3
+if DB_URL.startswith("postgresql://"):
+    DB_URL = DB_URL.replace("postgresql://", "postgresql+psycopg://")
+
 engine = create_engine(DB_URL)
 
 def read_sql_pl(sql: str, params=None) -> pl.DataFrame:
@@ -122,18 +127,19 @@ def calculate_sector_stats(conn, as_of_date):
     sql = """
     WITH price_data AS (
         -- 1. Lấy chuỗi giá và volume (Cần lịch sử dài để tính STDDEV)
+        -- P0: Use Return-based Sector Index (daily_sector_index) instead of Avg Close
         SELECT 
             s.trade_date, s.sector, d.super_sector,
-            s.close as sector_price,
+            s.index_value as sector_price, -- Use Index Value
             i.close as index_price,
-            s.volume as sector_volume,
-            s.close * s.volume as sector_turnover,
+            0 as sector_volume, -- Volume not used for RRG calc, only for X-Ray (which uses stock_stats)
+            0 as sector_turnover,
             s.trade_date as t_date -- Duplicate for safety
-        FROM daily_sector_prices s
+        FROM daily_sector_index s
         JOIN daily_vnindex_prices i ON s.trade_date = i.trade_date
         JOIN dim_sector d ON s.sector = d.sector
         WHERE s.trade_date <= %(as_of_date)s
-          AND s.trade_date >= %(as_of_date)s - INTERVAL '300 days' -- Buffer an toàn (increased for momentum window)
+          AND s.trade_date >= %(as_of_date)s - INTERVAL '300 days' -- Buffer an toàn
     ),
     rs_calc AS (
         -- 2. Tính Raw Relative Strength
@@ -196,8 +202,11 @@ def calculate_sector_stats(conn, as_of_date):
     sector_xray AS (
         SELECT
             sector,
-            -- Breadth: Percent Stocks > SMA20
-            COUNT(*) FILTER (WHERE close > sma20) :: float / NULLIF(COUNT(*), 0) as breadth,
+            -- Counts (P1: New Metrics)
+            COUNT(*) as sector_n,
+            COUNT(*) FILTER (WHERE sma20 IS NOT NULL) as breadth_n,
+            -- Breadth: Percent Stocks > SMA20 (Denominator = Valid SMA20)
+            COUNT(*) FILTER (WHERE close > sma20) :: float / NULLIF(COUNT(*) FILTER (WHERE sma20 IS NOT NULL), 0) as breadth,
             -- Concentration: Top 3 Turnover / Total Turnover
             (
                 SELECT SUM(s2.turnover)
@@ -206,35 +215,96 @@ def calculate_sector_stats(conn, as_of_date):
                     WHERE s_sub.sector = s_main.sector AND s_sub.trade_date = %(as_of_date)s
                     ORDER BY turnover DESC LIMIT 3
                 ) s2
-            ) / NULLIF(SUM(turnover), 0) as concentration
+            ) as top3_turnover,
+            SUM(turnover) as total_turnover,
+            -- Top Contributors: Store clean data "SYMBOL:XX.X, SYMBOL:YY.Y"
+            -- Frontend will add percent symbol for display
+            (
+                SELECT STRING_AGG(
+                    symbol || ':' || ROUND(CAST(contrib_pct AS NUMERIC), 1),
+                    ', '
+                    ORDER BY contrib_pct DESC
+                )
+                FROM (
+                    SELECT 
+                        symbol, 
+                        (turnover / NULLIF((SELECT SUM(turnover) FROM stock_stats s_total 
+                                           WHERE s_total.sector = s_main.sector 
+                                           AND s_total.trade_date = %(as_of_date)s), 0) * 100) as contrib_pct
+                    FROM stock_stats s_sub
+                    WHERE s_sub.sector = s_main.sector AND s_sub.trade_date = %(as_of_date)s
+                    ORDER BY turnover DESC
+                    LIMIT 3
+                ) top3
+            ) as top_contributors
         FROM stock_stats s_main
         WHERE trade_date = %(as_of_date)s
         GROUP BY sector
+    ),
+    joined_data AS (
+        SELECT 
+            r.*,
+            x.breadth,
+            x.breadth_n,
+            x.sector_n,
+            -- P1: Concentration Fix (NULL if <= 3 stocks)
+            CASE \n                WHEN x.sector_n <= 3 THEN NULL 
+                ELSE x.top3_turnover / NULLIF(x.total_turnover, 0) 
+            END as concentration,
+            x.top_contributors
+        FROM final_rrg r
+        LEFT JOIN sector_xray x ON r.sector = x.sector
     )
     -- 6. Upsert kết quả của ngày hiện tại
-    INSERT INTO sector_stats (sector, as_of_date, super_sector, rs_ratio, rs_momentum, momentum, breadth, concentration, turnover_shock_z, last_updated)
+    INSERT INTO sector_stats (sector, as_of_date, super_sector, rs_ratio, rs_momentum, momentum, breadth, concentration, turnover_shock_z, breadth_n, sector_n, tags, confidence, top_contributors, last_updated)
     SELECT 
-        r.sector, r.trade_date, r.super_sector, 
-        r.rs_ratio, r.rs_momentum, 
-        r.rs_momentum - 100 as momentum, -- Simple proxy
-        x.breadth, -- Allow NULL if missing (P1: No-Fill Policy)
-        x.concentration, -- Allow NULL if missing
-        r.turnover_shock_z, -- Allow NULL if missing
+        j.sector, j.trade_date, j.super_sector, 
+        j.rs_ratio, j.rs_momentum, 
+        j.rs_momentum - 100 as momentum,
+        j.breadth,
+        j.concentration,
+        j.turnover_shock_z,
+        j.breadth_n,
+        j.sector_n,
+        -- P1: Centralized Diagnosis Engine (Multi-label)
+        -- RRG 2.1: Removed strict gating (breadth_n >= 5) to allow diagnosis for small samples
+        -- Confidence score will indicate data quality instead
+        ARRAY_REMOVE(ARRAY[
+            CASE WHEN j.concentration > 0.6 AND j.breadth < 0.3 THEN 'TRU_KEO' END,
+            CASE WHEN j.breadth > 0.7 AND j.concentration < 0.4 THEN 'LAN_TOA_THAT' END,
+            CASE WHEN j.breadth > 0.7 AND j.rs_momentum > 100 THEN 'LAN_TOA' END,
+            CASE WHEN j.turnover_shock_z > 1.5 THEN 'TIEN_VAO' END,
+            CASE WHEN j.sector_n < 5 THEN 'SAMPLE_NHO' END
+        ], NULL) as tags,
+        -- P0: Confidence Score
+        -- Base 1.0. Penalty 0.5 for small sample (<5), 0.2 for low breadth coverage (<5).
+        GREATEST(0.0, 1.0 
+            - (CASE WHEN j.sector_n < 5 THEN 0.5 ELSE 0.0 END)
+            - (CASE WHEN j.breadth_n < 5 THEN 0.2 ELSE 0.0 END)
+        ) as confidence,
+        j.top_contributors,
         NOW()
-    FROM final_rrg r
-    LEFT JOIN sector_xray x ON r.sector = x.sector
-    WHERE r.trade_date = %(as_of_date)s
+    FROM joined_data j
+    WHERE j.trade_date = %(as_of_date)s
     ON CONFLICT (sector, as_of_date) DO UPDATE SET
         rs_ratio = EXCLUDED.rs_ratio,
         rs_momentum = EXCLUDED.rs_momentum,
         breadth = EXCLUDED.breadth,
         concentration = EXCLUDED.concentration,
         turnover_shock_z = EXCLUDED.turnover_shock_z,
+        breadth_n = EXCLUDED.breadth_n,
+        sector_n = EXCLUDED.sector_n,
+        tags = EXCLUDED.tags,
+        confidence = EXCLUDED.confidence,
+        top_contributors = EXCLUDED.top_contributors,
         last_updated = NOW();
     """
     
     try:
         with conn.cursor() as cur:
+            # P0: Calculate Sector Index first
+            calculate_sector_index(conn, as_of_date)
+            
             cur.execute(sql, {'as_of_date': as_of_date, 'scale': SCALE_FACTOR})
             conn.commit()
             logger.info(f"RRG 2.0 updated. Rows: {cur.rowcount}")
@@ -242,6 +312,62 @@ def calculate_sector_stats(conn, as_of_date):
         logger.error(f"Error calculating sector stats: {e}")
         conn.rollback()
         raise
+
+
+def calculate_sector_index(conn, as_of_date):
+    """
+    (Phase 3 P0) Calculates Return-based Sector Index (Base 100).
+    Formula: Index_t = Index_{t-1} * (1 + Avg(Return_i))
+    """
+    logger.info(f"Calculating Sector Index for {as_of_date}")
+    
+    # 1. Calculate Daily Returns for all stocks in window
+    # We need history to build the index if it doesn't exist, but for now we assume incremental update
+    # or we rebuild a chunk. Let's rebuild the last 300 days to be safe/robust for RRG.
+    
+    sql = """
+    WITH stock_returns AS (
+        SELECT 
+            t.trade_date,
+            w.sector,
+            t.symbol,
+            (t.close - LAG(t.close) OVER (PARTITION BY t.symbol ORDER BY t.trade_date)) / NULLIF(LAG(t.close) OVER (PARTITION BY t.symbol ORDER BY t.trade_date), 0) as daily_ret
+        FROM ta_silver t
+        JOIN symbol_watchlist w ON t.symbol = w.symbol
+        WHERE w.is_active = true
+          AND t.trade_date <= %(as_of_date)s
+          AND t.trade_date >= %(as_of_date)s - INTERVAL '365 days' -- 1 year lookback
+    ),
+    sector_daily_ret AS (
+        SELECT
+            sector,
+            trade_date,
+            AVG(daily_ret) as avg_return
+        FROM stock_returns
+        WHERE daily_ret IS NOT NULL
+        GROUP BY sector, trade_date
+    ),
+    sector_index_calc AS (
+        SELECT
+            sector,
+            trade_date,
+            avg_return,
+            -- Recursive calculation (Cumulative Product)
+            -- LN(1+r) -> Sum -> Exp
+            EXP(SUM(LN(1 + avg_return)) OVER (PARTITION BY sector ORDER BY trade_date)) * 100 as index_value
+        FROM sector_daily_ret
+    )
+    INSERT INTO daily_sector_index (sector, trade_date, index_value, daily_return)
+    SELECT sector, trade_date, index_value, avg_return
+    FROM sector_index_calc
+    ON CONFLICT (sector, trade_date) DO UPDATE SET
+        index_value = EXCLUDED.index_value,
+        daily_return = EXCLUDED.daily_return;
+    """
+    
+    with conn.cursor() as cur:
+        cur.execute(sql, {'as_of_date': as_of_date})
+        logger.info(f"Sector Index updated. Rows: {cur.rowcount}")
 
 
 def run_sql_plus_plus_macro(conn, as_of_date, tz):
@@ -583,7 +709,7 @@ def calculate_scores(df: pl.DataFrame, conn, enable_blend: bool) -> pl.DataFrame
 
 @contextmanager
 def pg_conn():
-    with psycopg.connect(os.getenv("PG_DSN")) as conn:
+    with psycopg.connect(os.getenv("DB_URL")) as conn:
         conn.autocommit = False
         yield conn
 
@@ -650,6 +776,7 @@ def run_feature_gold_batch():
 
             # (Point 5) Use timezone-aware date
             as_of_date = datetime.now(pytz.timezone(MACRO_TZ_STR)).date()
+            # as_of_date = datetime(2025, 11, 25).date()
 
             start_time = time.time()
             # This is called but the main logic inside is commented out until prerequisite tables exist.
@@ -665,13 +792,13 @@ def run_feature_gold_batch():
             # Using a placeholder query for now.
             df = read_sql_pl("SELECT * FROM v_features_asof", params=None)
 
-            df = apply_hmm(df)
-            df = calculate_scores(df, conn, ENABLE_MACRO_BLEND)
+            # df = apply_hmm(df)
+            # df = calculate_scores(df, conn, ENABLE_MACRO_BLEND)
 
-            logger.info("Feature gold batch job finished calculations and is ready to publish.")
+            # logger.info("Feature gold batch job finished calculations and is ready to publish.")
             # Publishing is commented out as the pipeline is not fully functional
-            version = f"v{pd.Timestamp.now().strftime('%Y%m%d%H%M%S')}"
-            atomic_publish(conn, df, version)
+            # version = f"v{pd.Timestamp.now().strftime('%Y%m%d%H%M%S')}"
+            # atomic_publish(conn, df, version)
 
             conn.commit()
 

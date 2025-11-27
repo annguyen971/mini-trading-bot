@@ -1,30 +1,20 @@
 import streamlit as st
-import httpx
-from app import check_auth # Assuming app.py contains check_auth
+from utils import get_api_client, HEADERS, API_BASE_URL
 from datetime import date
 import pandas as pd
 import os
 
-API_BASE_URL = os.getenv("API_BASE_URL", "http://api:8000")
-ADMIN_KEY = st.session_state.get("admin_key")
-HEADERS = {"X-ADMIN-KEY": ADMIN_KEY}
-
-# (Point 8) Add timeout to httpx client
-API_CLIENT = httpx.Client(timeout=10.0)
-
 st.set_page_config(page_title="Macro Impact Config", layout="wide")
 
-# (Point 8) Check auth
-if not check_auth() or not ADMIN_KEY:
-    st.error("🔒 Please authenticate via the main page.")
-    st.stop()
+# Auth is handled by utils import
 
 st.title("Bảng điều khiển & Ghi đè Tác động Vĩ mô (Story 5.7)")
 
 @st.cache_data(ttl=60)
 def fetch_data():
     """Fetches macro impact configuration data from the API."""
-    response = API_CLIENT.get(f"{API_BASE_URL}/admin/macro/impact", headers=HEADERS)
+    client = get_api_client()
+    response = client.get(f"/admin/macro/impact") # Base URL is already in client
     response.raise_for_status()
     return response.json()
 
@@ -49,7 +39,8 @@ def save_data(data_df):
         for r in payload
     ]
 
-    response = API_CLIENT.post(f"{API_BASE_URL}/admin/macro/impact", json=clean_payload, headers=HEADERS)
+    client = get_api_client()
+    response = client.post("/admin/macro/impact", json=clean_payload)
     response.raise_for_status()
     return True
 

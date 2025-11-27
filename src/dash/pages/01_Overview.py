@@ -240,7 +240,8 @@ if symbol:
         
         if st.button("🔍 Tìm kiếm Quá khứ (Deja Vu)"):
             with st.spinner("Scanning historical patterns..."):
-                similar_days = get_deja_vu(symbol)
+                deja_vu_data = get_deja_vu(symbol)
+                similar_days = deja_vu_data.get("similar_events", []) if deja_vu_data else []
                 
             if similar_days:
                 st.success(f"Found {len(similar_days)} similar historical patterns.")
