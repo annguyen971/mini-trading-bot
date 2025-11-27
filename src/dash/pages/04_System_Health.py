@@ -148,68 +148,209 @@ if health_data:
     if sector_rrg_data:
         df = pd.DataFrame(sector_rrg_data)
         
-        if not df.empty and all(col in df.columns for col in ['sector', 'rs_ratio', 'rs_momentum', 'super_sector']):
+        if not df.empty and all(col in df.columns for col in ['sector', 'rs_ratio', 'rs_momentum', 'super_sector', 'as_of_date']):
             try:
-                import plotly.express as px
+                import plotly.graph_objects as go
                 
-                # Create RRG Scatter Plot
-                fig = px.scatter(
-                    df,
-                    x='rs_ratio',
-                    y='rs_momentum',
-                    color='super_sector',
-                    text='sector',
-                    title='Relative Rotation Graph (RRG) - Sector Money Flow',
-                    labels={
-                        'rs_ratio': 'RS-Ratio (100 = Benchmark)',
-                        'rs_momentum': 'RS-Momentum (0 = No Change)',
-                        'super_sector': 'Super Sector'
-                    },
-                    hover_data=['sector', 'super_sector', 'rs_ratio', 'rs_momentum']
-                )
+                # 1. Prepare Data
+                # Sort by date to ensure trails are drawn correctly
+                df['as_of_date'] = pd.to_datetime(df['as_of_date'])
+                df = df.sort_values(['sector', 'as_of_date'])
                 
-                # Add quadrant lines
-                fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
-                fig.add_vline(x=100, line_dash="dash", line_color="gray", opacity=0.5)
+                # Get latest data for markers and labels
+                latest_date = df['as_of_date'].max()
+                df_latest = df[df['as_of_date'] == latest_date].copy()
                 
-                # Add quadrant labels
-                fig.add_annotation(x=110, y=5, text="<b>LEADING</b><br>Strong + Rising", showarrow=False, font=dict(size=10, color="green"))
-                fig.add_annotation(x=110, y=-5, text="<b>WEAKENING</b><br>Strong but Falling", showarrow=False, font=dict(size=10, color="orange"))
-                fig.add_annotation(x=90, y=-5, text="<b>LAGGING</b><br>Weak + Falling", showarrow=False, font=dict(size=10, color="red"))
-                fig.add_annotation(x=90, y=5, text="<b>IMPROVING</b><br>Weak but Rising", showarrow=False, font=dict(size=10, color="blue"))
+                # 2. Calculate Symmetric Range (Strict Square)
+                # Find max deviation from 100 across all data points (including history)
+                max_dev_x = max(abs(df['rs_ratio'].max() - 100), abs(df['rs_ratio'].min() - 100))
+                max_dev_y = max(abs(df['rs_momentum'].max() - 100), abs(df['rs_momentum'].min() - 100))
+                limit = max(max_dev_x, max_dev_y, 10.0) * 1.1 # Min 10.0 deviation, 10% buffer
                 
-                # Update layout
-                fig.update_traces(textposition='top center', marker=dict(size=12))
+                range_min = 100 - limit
+                range_max = 100 + limit
+                
+                # 3. Create Figure
+                fig = go.Figure()
+                
+                # Define colors for Super Sectors
+                super_sectors = df['super_sector'].unique()
+                palette = sns.color_palette("husl", len(super_sectors)).as_hex()
+                color_map = {sector: color for sector, color in zip(super_sectors, palette)}
+                
+                # 4. Draw Trails (History)
+                for sector in df['sector'].unique():
+                    sector_df = df[df['sector'] == sector]
+                    if len(sector_df) > 1:
+                        super_sec = sector_df['super_sector'].iloc[0]
+                        color = color_map.get(super_sec, 'grey')
+                        
+                        fig.add_trace(go.Scatter(
+                            x=sector_df['rs_ratio'],
+                            y=sector_df['rs_momentum'],
+                            mode='lines',
+                            line=dict(color=color, width=1, dash='dot'), # Thinner, dotted lines for trails
+                            opacity=0.5,
+                            showlegend=False,
+                            hoverinfo='skip'
+                        ))
+
+                # 5. Draw Markers (Latest)
+                for super_sec in super_sectors:
+                    sec_df = df_latest[df_latest['super_sector'] == super_sec]
+                    color = color_map.get(super_sec, 'grey')
+                    
+                    fig.add_trace(go.Scatter(
+                        x=sec_df['rs_ratio'],
+                        y=sec_df['rs_momentum'],
+                        mode='markers+text',
+                        marker=dict(size=12, color=color),
+                        text=sec_df['sector'],
+                        textposition='top center',
+                        name=super_sec,
+                        customdata=sec_df[['sector', 'breadth', 'concentration', 'turnover_shock_z']],
+                        hovertemplate="<b>%{text}</b><br>Ratio: %{x:.2f}<br>Mom: %{y:.2f}<br>Breadth: %{customdata[1]:.2f}<br>Conc: %{customdata[2]:.2f}<br>Shock: %{customdata[3]:.2f}<extra></extra>"
+                    ))
+                    
+                    # 6. Smart Annotations (Updated Logic)
+                    # TRỤ KÉO (Pillar Pull): Conc > 0.6 & Breadth < 0.3
+                    # LAN TỎA THẬT (True Broad Rally): Breadth > 0.7 & Conc < 0.4
+                    # LAN TỎA (Broad Rally): Breadth > 0.7 & Mom > 100 (Secondary)
+                    # TIỀN VÀO (Money In): Shock > 1.5
+                    
+                    for idx, row in sec_df.iterrows():
+                        alerts = []
+                        breadth = row.get('breadth', 0)
+                        conc = row.get('concentration', 0)
+                        shock = row.get('turnover_shock_z', 0)
+                        mom = row['rs_momentum']
+                        
+                        if conc > 0.6 and breadth < 0.3:
+                            alerts.append("TRỤ KÉO")
+                        elif breadth > 0.7 and conc < 0.4:
+                            alerts.append("LAN TỎA THẬT")
+                        elif breadth > 0.7 and mom > 100:
+                            alerts.append("LAN TỎA")
+                            
+                        if shock > 1.5:
+                            alerts.append("TIỀN VÀO")
+                            
+                        if alerts:
+                            alert_text = " | ".join(alerts)
+                            fig.add_annotation(
+                                x=row['rs_ratio'],
+                                y=row['rs_momentum'],
+                                text=f"<span style='color:red; font-size:10px'><b>{alert_text}</b></span>",
+                                showarrow=True,
+                                arrowhead=1,
+                                yshift=-20 # Shift below the marker
+                            )
+
+                # 7. Layout & Quadrants (P0: Strict Square & Center 100)
                 fig.update_layout(
+                    title='Relative Rotation Graph (RRG) 2.0 - Market X-Ray',
                     height=600,
-                    xaxis_title="RS-Ratio (Relative Strength vs VN-Index)",
-                    yaxis_title="RS-Momentum (Rate of Change)",
-                    showlegend=True
+                    width=600,
+                    xaxis=dict(title="RS-Ratio (Trend)", range=[range_min, range_max], constrain='domain', zeroline=False, showgrid=True),
+                    yaxis=dict(title="RS-Momentum (Velocity)", range=[range_min, range_max], scaleanchor="x", scaleratio=1, zeroline=False, showgrid=True),
+                    showlegend=True,
+                    template="plotly_white",
+                    shapes=[
+                        # Center Lines at 100, 100
+                        dict(type="line", x0=100, x1=100, y0=range_min, y1=range_max, line=dict(color="gray", width=2)),
+                        dict(type="line", x0=range_min, x1=range_max, y0=100, y1=100, line=dict(color="gray", width=2))
+                    ]
                 )
                 
-                st.plotly_chart(fig, use_container_width=True)
+                # Quadrant Labels (Anchored to 100)
+                mid = limit / 2
+                fig.add_annotation(x=100+mid, y=100+mid, text="<b>LEADING</b>", showarrow=False, font=dict(color="green", size=14))
+                fig.add_annotation(x=100+mid, y=100-mid, text="<b>WEAKENING</b>", showarrow=False, font=dict(color="orange", size=14))
+                fig.add_annotation(x=100-mid, y=100-mid, text="<b>LAGGING</b>", showarrow=False, font=dict(color="red", size=14))
+                fig.add_annotation(x=100-mid, y=100+mid, text="<b>IMPROVING</b>", showarrow=False, font=dict(color="blue", size=14))
+
+                st.plotly_chart(fig, use_container_width=False)
                 
                 # Add explanation
-                with st.expander("ℹ️ How to Read RRG"):
+                with st.expander("ℹ️ How to Read RRG 2.0"):
                     st.markdown("""
-                    **Relative Rotation Graph (RRG)** hiển thị dòng tiền xoay vòng giữa các ngành:
+                    **Relative Rotation Graph (RRG) 2.0** với Market X-Ray:
                     
-                    - **Trục X (RS-Ratio)**: Xu hướng dài hạn (60 ngày) so với VN-Index
-                        - \u003e 100: Ngành mạnh hơn thị trường
-                        - \u003c 100: Ngành yếu hơn thị trường
+                    - **Trục X (RS-Ratio)**: Xu hướng dài hạn (6 tháng). >100 là Mạnh.
+                    - **Trục Y (RS-Momentum)**: Gia tốc ngắn hạn (2 tuần). >100 là Tăng tốc.
+                    - **Đuôi (Trails)**: 5 phiên gần nhất, cho thấy hướng di chuyển.
                     
-                    - **Trục Y (RS-Momentum)**: Đà thay đổi ngắn hạn
-                        - \u003e 0: Đang tăng tốc
-                        - \u003c 0: Đang giảm tốc
-                    
-                    **4 Góc phần tư**:
-                    - 🟢 **Leading**: Ngành dẫn dắt (mạnh + tăng tốc)
-                    - 🟠 **Weakening**: Ngành suy yếu (mạnh nhưng giảm tốc)
-                    - 🔴 **Lagging**: Ngành tụt hậu (yếu + giảm tốc)
-                    - 🔵 **Improving**: Ngành cải thiện (yếu nhưng tăng tốc)
-                    
-                    **Màu sắc**: Nhóm theo "4 Trụ cột + 1" (Financials, Real Estate Chain, Production & Export, Consumer & Tech, Utilities)
+                    **Cảnh báo thông minh (Market X-Ray):**
+                    - 🚨 **TRỤ KÉO (Pillar Pull)**: Ngành mạnh nhưng Độ tập trung cao (>60% vol vào Top 3). Xanh vỏ đỏ lòng?
+                    - 🌊 **LAN TỎA (Broad Rally)**: Ngành tăng tốc với Độ rộng tốt (>70% mã > SMA20). Tăng bền vững.
+                    - 💰 **TIỀN VÀO (Money In)**: Đột biến thanh khoản (Turnover Shock > 1.5 sigma). Dòng tiền lớn tham gia.
                     """)
+
+                # --- Market X-Ray Table (User Request - Final Fix) ---
+                st.markdown("---")
+                st.subheader("🔬 Market X-Ray: Soi Chiếu Cấu Trúc Ngành")
+
+                # Debug Log
+                if 'df_latest' in locals() and not df_latest.empty:
+                    st.caption(f"Debug: Loaded {len(df_latest)} rows for Market X-Ray.")
+                    
+                    # 1. Use Latest Data
+                    xray_df = df_latest.copy()
+                    
+                    # 2. Ensure Columns Exist (Fix lỗi thiếu cột)
+                    required_cols = ['concentration', 'breadth', 'turnover_shock_z', 'rs_ratio', 'sector']
+                    for col in required_cols:
+                        if col not in xray_df.columns:
+                            xray_df[col] = 0.0 # Fill default
+                            
+                    # 3. Diagnose Logic
+                    def diagnose(row):
+                        conc = float(row.get('concentration', 0) or 0)
+                        breadth = float(row.get('breadth', 0) or 0)
+                        shock = float(row.get('turnover_shock_z', 0) or 0)
+                        ratio = float(row.get('rs_ratio', 100))
+                        
+                        alerts = []
+                        # Logic Trụ Kéo
+                        if ratio > 100 and conc > 0.6 and breadth < 0.3:
+                            alerts.append("⚠️ TRỤ KÉO")
+                        # Logic Lan Tỏa
+                        if ratio > 100 and breadth > 0.7:
+                            alerts.append("🌊 LAN TỎA")
+                        # Logic Tiền Vào
+                        if shock > 1.5:
+                            alerts.append("🔥 TIỀN VÀO")
+                            
+                        return ", ".join(alerts) if alerts else "Bình thường"
+
+                    xray_df['Chẩn đoán'] = xray_df.apply(diagnose, axis=1)
+                    
+                    # 4. Display Table (Chọn cột hiển thị)
+                    display_cols = ['sector', 'rs_ratio', 'rs_momentum', 'breadth', 'concentration', 'turnover_shock_z', 'Chẩn đoán']
+                    
+                    # Format Style
+                    def color_row(row):
+                        val = row['Chẩn đoán']
+                        if "TRỤ KÉO" in val: return ['background-color: #ffebee'] * len(row)
+                        if "LAN TỎA" in val: return ['background-color: #e8f5e9'] * len(row)
+                        if "TIỀN VÀO" in val: return ['background-color: #fffde7'] * len(row)
+                        return [''] * len(row)
+
+                    st.dataframe(
+                        xray_df[display_cols].style.apply(color_row, axis=1)
+                                             .format({
+                                                 'rs_ratio': '{:.1f}',
+                                                 'rs_momentum': '{:.1f}',
+                                                 'breadth': '{:.0%}',
+                                                 'concentration': '{:.0%}',
+                                                 'turnover_shock_z': '{:.1f}σ'
+                                             }),
+                        use_container_width=True,
+                        height=500
+                    )
+                else:
+                    st.error("❌ Không có dữ liệu Sector Stats (df_latest is empty). Vui lòng kiểm tra Backend.")
+
             except Exception as e:
                 st.error(f"Could not generate RRG chart: {e}")
                 st.dataframe(df)

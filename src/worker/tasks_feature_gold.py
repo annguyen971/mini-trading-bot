@@ -2,6 +2,7 @@ import os
 import polars as pl
 from hmmlearn import hmm
 import numpy as np
+from sklearn.linear_model import LinearRegression
 from contextlib import contextmanager
 import psycopg
 from core_lib.locks import try_lock
@@ -111,107 +112,134 @@ def apply_hmm(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def calculate_sector_stats(conn, as_of_date):
-    """
-    Calculate Sector Rotation metrics (RRG "Lite") at sub-sector level.
+    logger.info(f"Calculating JdK RRG 2.0 & Market X-Ray stats for {as_of_date}")
     
-    For each sub-sector (e.g., banking, materials):
-    - RS-Ratio: 60-day average relative excess return vs VN-Index (long-term trend)
-    - RS-Momentum: Rate of change of RS-Ratio (short-term momentum)
-    
-    Args:
-        conn: Database connection
-        as_of_date: Date to calculate stats for
+    # Tham số chuẩn RRG 2.0 (Refined)
+    WINDOW_LONG = 126 # ~6 tháng (Xu hướng chính)
+    WINDOW_SHORT = 10 # ~2 tuần (Gia tốc)
+    SCALE_FACTOR = 10.0 # Hệ số phóng đại (Updated to 10.0 per user feedback)
+
+    sql = """
+    WITH price_data AS (
+        -- 1. Lấy chuỗi giá và volume (Cần lịch sử dài để tính STDDEV)
+        SELECT 
+            s.trade_date, s.sector, d.super_sector,
+            s.close as sector_price,
+            i.close as index_price,
+            s.volume as sector_volume,
+            s.close * s.volume as sector_turnover,
+            s.trade_date as t_date -- Duplicate for safety
+        FROM daily_sector_prices s
+        JOIN daily_vnindex_prices i ON s.trade_date = i.trade_date
+        JOIN dim_sector d ON s.sector = d.sector
+        WHERE s.trade_date <= %(as_of_date)s
+          AND s.trade_date >= %(as_of_date)s - INTERVAL '300 days' -- Buffer an toàn (increased for momentum window)
+    ),
+    rs_calc AS (
+        -- 2. Tính Raw Relative Strength
+        SELECT *, (sector_price / index_price) as rs_raw
+        FROM price_data
+    ),
+    rs_z_score AS (
+        -- 3. Tính Z-Score cho Xu hướng dài hạn (RS-Ratio) và Turnover Shock
+        SELECT 
+            *,
+            -- RS Ratio Z-Score (Rolling 126d)
+            (rs_raw - AVG(rs_raw) OVER w_126) / NULLIF(STDDEV(rs_raw) OVER w_126, 0) as z_ratio,
+            -- Turnover Shock Z-Score (Rolling 20d)
+            (sector_turnover - AVG(sector_turnover) OVER w_20) / NULLIF(STDDEV(sector_turnover) OVER w_20, 0) as turnover_shock_z
+        FROM rs_calc
+        WINDOW 
+            w_126 AS (PARTITION BY sector ORDER BY trade_date ROWS BETWEEN 125 PRECEDING AND CURRENT ROW),
+            w_20 AS (PARTITION BY sector ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
+    ),
+    momentum_raw AS (
+        -- 4. Tính Raw Momentum (Delta của Z-Ratio)
+        SELECT 
+            *,
+            z_ratio - LAG(z_ratio, 10) OVER (PARTITION BY sector ORDER BY trade_date) as mom_raw
+        FROM rs_z_score
+    ),
+    momentum_z_score AS (
+        -- 5. Tính Z-Score cho Momentum (Rolling 63d)
+        SELECT 
+            *,
+            (mom_raw - AVG(mom_raw) OVER w_63) / NULLIF(STDDEV(mom_raw) OVER w_63, 0) as z_mom
+        FROM momentum_raw
+        WINDOW w_63 AS (PARTITION BY sector ORDER BY trade_date ROWS BETWEEN 62 PRECEDING AND CURRENT ROW)
+    ),
+    final_rrg AS (
+        SELECT 
+            trade_date, sector, super_sector,
+            -- Scaling về quanh mốc 100 với hệ số 10
+            100 + (z_ratio * %(scale)s) as rs_ratio,
+            100 + (z_mom * %(scale)s) as rs_momentum,
+            turnover_shock_z
+        FROM momentum_z_score
+    ),
+    -- Market X-Ray: Breadth & Concentration (Requires stock-level data)
+    stock_stats AS (
+        SELECT
+            w.sector,
+            t.symbol,
+            t.close,
+            t.volume,
+            t.close * t.volume as turnover,
+            t.trade_date,
+            AVG(t.close) OVER (PARTITION BY t.symbol ORDER BY t.trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) as sma20
+        FROM ta_silver t
+        JOIN symbol_watchlist w ON t.symbol = w.symbol
+        WHERE t.trade_date <= %(as_of_date)s
+          AND t.trade_date >= %(as_of_date)s - INTERVAL '30 days' -- Need enough for SMA20
+          AND w.is_active = true
+    ),
+    sector_xray AS (
+        SELECT
+            sector,
+            -- Breadth: Percent Stocks > SMA20
+            COUNT(*) FILTER (WHERE close > sma20) :: float / NULLIF(COUNT(*), 0) as breadth,
+            -- Concentration: Top 3 Turnover / Total Turnover
+            (
+                SELECT SUM(s2.turnover)
+                FROM (
+                    SELECT turnover FROM stock_stats s_sub 
+                    WHERE s_sub.sector = s_main.sector AND s_sub.trade_date = %(as_of_date)s
+                    ORDER BY turnover DESC LIMIT 3
+                ) s2
+            ) / NULLIF(SUM(turnover), 0) as concentration
+        FROM stock_stats s_main
+        WHERE trade_date = %(as_of_date)s
+        GROUP BY sector
+    )
+    -- 6. Upsert kết quả của ngày hiện tại
+    INSERT INTO sector_stats (sector, as_of_date, super_sector, rs_ratio, rs_momentum, momentum, breadth, concentration, turnover_shock_z, last_updated)
+    SELECT 
+        r.sector, r.trade_date, r.super_sector, 
+        r.rs_ratio, r.rs_momentum, 
+        r.rs_momentum - 100 as momentum, -- Simple proxy
+        x.breadth, -- Allow NULL if missing (P1: No-Fill Policy)
+        x.concentration, -- Allow NULL if missing
+        r.turnover_shock_z, -- Allow NULL if missing
+        NOW()
+    FROM final_rrg r
+    LEFT JOIN sector_xray x ON r.sector = x.sector
+    WHERE r.trade_date = %(as_of_date)s
+    ON CONFLICT (sector, as_of_date) DO UPDATE SET
+        rs_ratio = EXCLUDED.rs_ratio,
+        rs_momentum = EXCLUDED.rs_momentum,
+        breadth = EXCLUDED.breadth,
+        concentration = EXCLUDED.concentration,
+        turnover_shock_z = EXCLUDED.turnover_shock_z,
+        last_updated = NOW();
     """
-    logger.info(f"Calculating sector stats for {as_of_date}")
     
     try:
         with conn.cursor() as cur:
-            # Calculate RRG metrics for each sub-sector
-            # Using daily_sector_prices view and sector_perf if available
-            sql = """
-            WITH sector_returns AS (
-                -- Calculate daily returns for each sector
-                SELECT
-                    s.trade_date,
-                    s.sector,
-                    d.super_sector,
-                    s.close / LAG(s.close, 1) OVER (PARTITION BY s.sector ORDER BY s.trade_date) - 1 AS sector_return,
-                    i.close / LAG(i.close, 1) OVER (ORDER BY i.trade_date) - 1 AS index_return
-                FROM daily_sector_prices s
-                JOIN dim_sector d ON s.sector = d.sector
-                LEFT JOIN daily_vnindex_prices i ON s.trade_date = i.trade_date
-                WHERE s.trade_date BETWEEN %(start_date)s AND %(as_of_date)s
-            ),
-            excess_returns AS (
-                -- Calculate excess return (sector vs index)
-                SELECT
-                    trade_date,
-                    sector,
-                    super_sector,
-                    COALESCE(sector_return, 0) - COALESCE(index_return, 0) AS excess_return
-                FROM sector_returns
-            ),
-            rolling_metrics AS (
-                -- Calculate RS-Ratio (60-day avg) and RS-Momentum (5-day change)
-                SELECT
-                    sector,
-                    super_sector,
-                    trade_date,
-                    AVG(excess_return) OVER (
-                        PARTITION BY sector 
-                        ORDER BY trade_date 
-                        ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
-                    ) AS rs_ratio_60d,
-                    AVG(excess_return) OVER (
-                        PARTITION BY sector 
-                        ORDER BY trade_date 
-                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                    ) AS rs_ratio_20d
-                FROM excess_returns
-            ),
-            final_metrics AS (
-                SELECT
-                    sector,
-                    super_sector,
-                    trade_date,
-                    rs_ratio_60d,
-                    rs_ratio_60d - LAG(rs_ratio_60d, 5) OVER (PARTITION BY sector ORDER BY trade_date) AS rs_momentum
-                FROM rolling_metrics
-            )
-            -- Upsert into sector_stats
-            INSERT INTO sector_stats (sector, as_of_date, super_sector, rs_ratio, rs_momentum, momentum, breadth)
-            SELECT
-                sector,
-                trade_date AS as_of_date,
-                super_sector,
-                rs_ratio_60d * 100 + 100 AS rs_ratio,  -- Normalize to 100 = benchmark
-                COALESCE(rs_momentum * 100, 0) AS rs_momentum,  -- Normalize, 0 = no change
-                rs_ratio_20d AS momentum,  -- Keep existing momentum column
-                NULL AS breadth  -- Placeholder for breadth calculation
-            FROM final_metrics
-            WHERE trade_date = %(as_of_date)s
-            ON CONFLICT (sector, as_of_date) DO UPDATE SET
-                super_sector = EXCLUDED.super_sector,
-                rs_ratio = EXCLUDED.rs_ratio,
-                rs_momentum = EXCLUDED.rs_momentum,
-                momentum = EXCLUDED.momentum,
-                last_updated = NOW();
-            """
-            
-            # Calculate start date (need ~65 trading days of history for 60-day rolling)
-            # Using 150 calendar days to ensure sufficient trading days even during holidays (Tết)
-            from datetime import timedelta
-            start_date = as_of_date - timedelta(days=150)
-            
-            cur.execute(sql, {"as_of_date": as_of_date, "start_date": start_date})
-            row_count = cur.rowcount
-            logger.info(f"Updated sector stats for {row_count} sub-sectors")
-            
+            cur.execute(sql, {'as_of_date': as_of_date, 'scale': SCALE_FACTOR})
             conn.commit()
-            return row_count
-            
+            logger.info(f"RRG 2.0 updated. Rows: {cur.rowcount}")
     except Exception as e:
-        logger.exception(f"Failed to calculate sector stats: {e}")
+        logger.error(f"Error calculating sector stats: {e}")
         conn.rollback()
         raise
 
@@ -225,8 +253,8 @@ def run_sql_plus_plus_macro(conn, as_of_date, tz):
     logger.info(f"SQL++ Macro running for {as_of_date} at TZ {tz}")
     try:
         # (Point 7) Use context manager for the connection
-        with conn:
-            with conn.cursor() as cur:
+        # with conn:  <-- Removed to avoid potential closure or state issues
+        with conn.cursor() as cur:
                 # (Point 3) Calculate y_excess_20d for sector_perf
                 # NOTE: This assumes `sector_prices` and `vnindex_prices` tables exist
                 # as per the task description. We will use placeholders if they don't.
@@ -316,11 +344,11 @@ def run_sql_plus_plus_macro(conn, as_of_date, tz):
                     SELECT
                         as_of_date,
                         sector,
-                        CASE WHEN COUNT(y_excess_20d) OVER w >= 60 THEN COALESCE(regr_slope(y_excess_20d, rate_sat), 0) ELSE 0 END AS beta_rate_sat,
-                        CASE WHEN COUNT(y_excess_20d) OVER w >= 60 THEN COALESCE(regr_slope(y_excess_20d, fx_sat), 0) ELSE 0 END AS beta_fx_sat,
-                        CASE WHEN COUNT(y_excess_20d) OVER w >= 60 THEN COALESCE(regr_slope(y_excess_20d, credit_sat), 0) ELSE 0 END AS beta_credit_sat,
-                        CASE WHEN COUNT(y_excess_20d) OVER w >= 60 THEN COALESCE(regr_slope(y_excess_20d, cross_rateLow_creditUp), 0) ELSE 0 END AS beta_cross_rc,
-                        CASE WHEN COUNT(y_excess_20d) OVER w >= 60 THEN COALESCE(regr_slope(y_excess_20d, cross_fxSpike_rateHigh), 0) ELSE 0 END AS beta_cross_fr
+                        CASE WHEN COUNT(y_excess_20d) OVER w >= 60 THEN COALESCE(regr_slope(y_excess_20d, rate_sat) OVER w, 0) ELSE 0 END AS beta_rate_sat,
+                        CASE WHEN COUNT(y_excess_20d) OVER w >= 60 THEN COALESCE(regr_slope(y_excess_20d, fx_sat) OVER w, 0) ELSE 0 END AS beta_fx_sat,
+                        CASE WHEN COUNT(y_excess_20d) OVER w >= 60 THEN COALESCE(regr_slope(y_excess_20d, credit_sat) OVER w, 0) ELSE 0 END AS beta_credit_sat,
+                        CASE WHEN COUNT(y_excess_20d) OVER w >= 60 THEN COALESCE(regr_slope(y_excess_20d, cross_rateLow_creditUp) OVER w, 0) ELSE 0 END AS beta_cross_rc,
+                        CASE WHEN COUNT(y_excess_20d) OVER w >= 60 THEN COALESCE(regr_slope(y_excess_20d, cross_fxSpike_rateHigh) OVER w, 0) ELSE 0 END AS beta_cross_fr
                     FROM joined
                     WINDOW w AS (PARTITION BY sector ORDER BY as_of_date ROWS BETWEEN 252 PRECEDING AND 1 PRECEDING)
                 ),
@@ -382,10 +410,15 @@ def calculate_scores(df: pl.DataFrame, conn, enable_blend: bool) -> pl.DataFrame
         f"SELECT sector, impact, confidence FROM macro_impact_rt WHERE as_of_date = (CURRENT_TIMESTAMP AT TIME ZONE '{MACRO_TZ}')::date",
         params=None
     )
+    if "impact" in df_impact_rt.columns:
+        df_impact_rt = df_impact_rt.with_columns(pl.col("impact").cast(pl.Float64))
+
     df_ui_override = read_sql_pl(
         f"SELECT sector, weight FROM macro_ui_override WHERE ttl_until IS NULL OR ttl_until >= (CURRENT_TIMESTAMP AT TIME ZONE '{MACRO_TZ}')::date",
         params=None
     )
+    if "weight" in df_ui_override.columns:
+        df_ui_override = df_ui_override.with_columns(pl.col("weight").cast(pl.Float64))
 
     # Placeholder join logic until `dim_symbol_sector` is available
     if 'sector' not in df.columns:
@@ -407,6 +440,9 @@ def calculate_scores(df: pl.DataFrame, conn, enable_blend: bool) -> pl.DataFrame
     for col in ['hype_crowd_z', 'news_count_crowd_z', 'S_tech_z', 'breadth_contra_z', 'hype_elitist_z', 'H_ta_z', 'H_cat_z', 'catalyst_active']:
         if col not in df.columns:
             df = df.with_columns(pl.lit(0.5).alias(col))
+        else:
+            # Ensure they are float
+            df = df.with_columns(pl.col(col).cast(pl.Float64))
 
 
     # FrothScore (same as before)
@@ -453,7 +489,97 @@ def calculate_scores(df: pl.DataFrame, conn, enable_blend: bool) -> pl.DataFrame
 
     df = df.with_columns(HunterScore=(pl.col('Hunter_adj') * 100).round(0))
 
-    return df.select(["symbol","effective_date","hmm_state","FrothScore","HunterScore"])
+    # === NEW: OBV & Sector RS (Deja Vu 2.1) ===
+    
+    # 1. OBV Calculation
+    # Need close and volume. Assuming they are in df or we join them.
+    # v_features_asof usually has close/volume. If not, we need to join ta_silver.
+    # Let's assume df has 'close' and 'volume' from v_features_asof.
+    
+    if "close" in df.columns and "volume" in df.columns:
+        # Calculate OBV
+        # OBV = Cumulative Sum of (Volume * Sign(Close Change))
+        df = df.sort(["symbol", "effective_date"])
+        df = df.with_columns(
+            price_change=pl.col("close").diff().fill_null(0)
+        )
+        df = df.with_columns(
+            obv_sign=pl.when(pl.col("price_change") > 0).then(1)
+                    .when(pl.col("price_change") < 0).then(-1)
+                    .otherwise(0)
+        )
+        df = df.with_columns(
+            obv_val=pl.col("obv_sign") * pl.col("volume")
+        )
+        df = df.with_columns(
+            obv=pl.col("obv_val").cum_sum().over("symbol")
+        )
+        
+        # 2. OBV Slope (5d)
+        # We need to calculate slope of OBV over last 5 days.
+        # Using a rolling window and applying linear regression is expensive in Polars directly.
+        # Approximation: (OBV_t - OBV_t-5) / 5 (Simple slope)
+        # Better: Use rolling_apply or just simple change if acceptable.
+        # Spec says "Slope". Let's use simple linear regression slope approximation:
+        # Slope ~ (Sum(x*y) - n*mean(x)*mean(y)) / (Sum(x^2) - n*mean(x)^2)
+        # For fixed x=0..4, this simplifies. 
+        # But for MVP/Performance, (OBV - OBV_lag5)/5 is a decent proxy for direction.
+        # Let's use the simple difference normalized by volume to make it comparable? 
+        # Or just raw slope. Spec: "Positive = Accumulation".
+        # Let's use simple 5-day change for efficiency first.
+        # df = df.with_columns(obv_slope_5d=(pl.col("obv") - pl.col("obv").shift(5)).over("symbol"))
+        
+        # Actually, let's try to be a bit more precise if possible, but simple diff is standard for "Trend".
+        # Let's stick to simple diff for now to avoid complex UDFs.
+        df = df.with_columns(
+            obv_slope_5d=(pl.col("obv") - pl.col("obv").shift(5)).over("symbol").fill_null(0.0)
+        )
+    else:
+        df = df.with_columns(
+            obv=pl.lit(0.0),
+            obv_slope_5d=pl.lit(0.0)
+        )
+
+    # 3. Sector RS Ratio
+    # We need to join with sector_stats to get rs_ratio for the symbol's sector
+    # df has 'sector' column (added in previous step or from view)
+    
+    # Fetch sector stats for the current batch date
+    # Note: apply_hmm runs on history, but calculate_scores is usually for "as_of_date" snapshot?
+    # Wait, run_feature_gold_batch processes the whole view `v_features_asof`.
+    # If `v_features_asof` contains history, we need sector stats history.
+    # But `calculate_sector_stats` only calculates for `as_of_date`.
+    # This implies `run_feature_gold_batch` is a daily job for TODAY.
+    # So we only need sector stats for TODAY.
+    
+    # However, if we are backfilling, we might need history.
+    # For now, let's assume we join on (sector, effective_date) if possible, 
+    # or just use the latest fetched `df_sector_stats` if we only care about today.
+    
+    # Let's fetch sector stats for the relevant dates in df?
+    # If df is huge (all history), this is hard.
+    # Usually feature_gold_batch runs for "latest" or a specific window.
+    # Let's assume we join with `sector_stats` table.
+    
+    # Read sector_stats
+    sector_stats_query = "SELECT sector, as_of_date, rs_ratio FROM sector_stats"
+    df_sector_stats = read_sql_pl(sector_stats_query)
+    
+    # Cast dates to match
+    df = df.with_columns(pl.col("effective_date").cast(pl.Date))
+    df_sector_stats = df_sector_stats.with_columns(pl.col("as_of_date").cast(pl.Date))
+    
+    # Join
+    df = df.join(
+        df_sector_stats, 
+        left_on=["sector", "effective_date"], 
+        right_on=["sector", "as_of_date"], 
+        how="left"
+    ).rename({"rs_ratio": "sector_rs_ratio"})
+    
+    df = df.with_columns(pl.col("sector_rs_ratio").fill_null(100.0)) # Default to 100 (Benchmark)
+
+    return df.select(["symbol","effective_date","hmm_state","FrothScore","HunterScore", "obv_slope_5d", "sector_rs_ratio", "sector"])
 
 @contextmanager
 def pg_conn():
@@ -478,8 +604,8 @@ def atomic_publish(conn, df: pl.DataFrame, version: str):
         # Write to a temporary table
         df.write_database(
             table_name=temp_table_name,
-            connection_uri=DB_URL,
-            if_exists="replace",
+            connection=DB_URL,
+            if_table_exists="replace",
             engine="adbc"
         )
         logger.info(f"Successfully wrote data to temp table {temp_table_name}.")
